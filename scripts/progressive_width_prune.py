@@ -75,6 +75,17 @@ def parse_args(argv=None):
     g.add_argument("--attn", default="sdpa")
     g.add_argument("--seed", type=int, default=42)
     g.add_argument("--num-workers", type=int, default=0)
+    g.add_argument(
+        "--min-frames", type=int, default=50, help="drop utterances shorter than this"
+    )
+    g.add_argument(
+        "--max-frames",
+        type=int,
+        default=600,
+        help="drop utterances longer than this. Activation memory carries an S^2 "
+        "term, so one long bucket can OOM a run that is otherwise comfortable; "
+        "600 frames is ~24 s of audio.",
+    )
 
     g = p.add_argument_group("ladder")
     g.add_argument(
@@ -146,6 +157,20 @@ def parse_args(argv=None):
         help="surgery + repair only; useful for sweeping k on the cheap proxy",
     )
     g.add_argument("--max-dev-batches", type=int, default=0)
+    g.add_argument(
+        "--grad-checkpointing",
+        action="store_true",
+        help="recompute layer activations in the backward pass: ~5x less "
+        "activation memory for ~30%% more compute. The cheapest way to raise "
+        "--batch-tokens.",
+    )
+    g.add_argument(
+        "--teacher-dtype",
+        default=None,
+        choices=list(DTYPES),
+        help="teacher precision (default: same as --dtype). It is frozen, so "
+        "bf16 costs nothing and saves ~1.2 GB.",
+    )
 
     return p.parse_args(argv)
 
@@ -212,8 +237,14 @@ def main(argv=None):
     path = _resolve_model_path(args.model)
     tokenizer = AutoTokenizer.from_pretrained(path)
 
-    teacher = load_model(path, dtype, args.attn, device)
+    teacher_dtype = DTYPES[args.teacher_dtype] if args.teacher_dtype else dtype
+    teacher = load_model(path, teacher_dtype, args.attn, device)
     student = load_model(path, dtype, args.attn, device)
+    if args.grad_checkpointing:
+        student.llm.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+        print("gradient checkpointing: enabled on the student backbone")
     d0 = teacher.config.llm_config.hidden_size
     print(
         f"teacher: hidden_size={d0} layers={teacher.config.llm_config.num_hidden_layers} "
@@ -229,17 +260,18 @@ def main(argv=None):
 
     processor = build_processor(student.config, tokenizer)
 
+    ds_kw = {"min_frames": args.min_frames, "max_frames": args.max_frames}
     calib_ds = CodecManifestDataset(
-        args.dev_manifest, args.data_root, limit=args.calib_samples
+        args.dev_manifest, args.data_root, limit=args.calib_samples, **ds_kw
     )
-    dev_ds = CodecManifestDataset(args.dev_manifest, args.data_root)
+    dev_ds = CodecManifestDataset(args.dev_manifest, args.data_root, **ds_kw)
     # Building the training set scans every codec header to fill the length
     # cache (~300k files on the first run), so skip it entirely when there is no
     # recovery to run -- that is what keeps the --skip-recovery sweep cheap.
     train_ds = (
         None
         if args.skip_recovery
-        else CodecManifestDataset(args.train_manifest, args.data_root)
+        else CodecManifestDataset(args.train_manifest, args.data_root, **ds_kw)
     )
     train_desc = (
         "skipped"
