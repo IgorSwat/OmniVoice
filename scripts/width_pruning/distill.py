@@ -222,10 +222,12 @@ def distill(
             loss = cfg.kd_weight * kd + cfg.ce_weight * ce + cfg.hidden_weight * hid
 
         scaler.scale(loss / cfg.grad_accum).backward()
-        running["loss"] += float(loss)
-        running["kd"] += float(kd)
-        running["ce"] += float(ce)
-        running["hidden"] += float(hid)
+        # .detach() before the scalar read: keeps the autograd graph from being
+        # held alive by these locals across the grad-accumulation `continue`.
+        running["loss"] += float(loss.detach())
+        running["kd"] += float(kd.detach())
+        running["ce"] += float(ce.detach())
+        running["hidden"] += float(hid.detach())
         micro += 1
 
         if micro % cfg.grad_accum != 0:

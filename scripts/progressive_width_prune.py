@@ -81,13 +81,12 @@ def parse_args(argv=None):
     g.add_argument(
         "--max-frames",
         type=int,
-        default=600,
-        help="drop utterances longer than this. Activation memory carries an S^2 "
-        "term, so one long bucket can OOM a run that is otherwise comfortable; "
-        "600 frames is ~24 s of audio.",
+        default=2000,
+        help="drop utterances longer than this. The corpus already tops out at "
+        "750 frames (30 s), so the default never binds; lower it only to trade "
+        "data for memory, since activation cost per token grows with sequence "
+        "length.",
     )
-
-    g = p.add_argument_group("ladder")
     g.add_argument(
         "--widths",
         type=int,
@@ -260,7 +259,11 @@ def main(argv=None):
 
     processor = build_processor(student.config, tokenizer)
 
-    ds_kw = {"min_frames": args.min_frames, "max_frames": args.max_frames}
+    ds_kw = {
+        "tokenizer": tokenizer,
+        "min_frames": args.min_frames,
+        "max_frames": args.max_frames,
+    }
     calib_ds = CodecManifestDataset(
         args.dev_manifest, args.data_root, limit=args.calib_samples, **ds_kw
     )
@@ -279,6 +282,10 @@ def main(argv=None):
         else f"{len(train_ds)} utts ({train_ds.hours:.1f} h, {train_ds.dropped} dropped)"
     )
     print(f"data: train {train_desc}  dev {len(dev_ds)}  calib {len(calib_ds)}")
+    if train_ds is not None:
+        print(
+            f"      longest padded sequence in train: {max(train_ds.lengths)} tokens"
+        )
 
     def loader(ds, batch_tokens, shuffle):
         return build_dataloader(

@@ -22,6 +22,15 @@ from torch.utils.data import DataLoader, Dataset
 # Codec frame rate of the Higgs audio tokenizer, used only for logging hours.
 FRAME_RATE = 25
 
+# Fallback prefix estimate when no tokenizer is supplied. Only a fallback: see
+# CodecManifestDataset._load_or_build_lengths for why guessing this is unsafe.
+DEFAULT_PREFIX_SLACK = 48
+
+
+def _read_manifest(f):
+    """Rows of a pipe-separated manifest, with quote processing disabled."""
+    return csv.DictReader(f, delimiter="|", quoting=csv.QUOTE_NONE)
+
 
 def codec_path(name: str, data_root: str = "data") -> str:
     dirs, base = name.rsplit("/", 1)
@@ -44,6 +53,7 @@ class CodecManifestDataset(Dataset):
         self,
         manifest: str,
         data_root: str = "data",
+        tokenizer=None,
         min_frames: int = 50,
         max_frames: int = 2000,
         limit: int = 0,
@@ -51,40 +61,72 @@ class CodecManifestDataset(Dataset):
     ):
         self.data_root = data_root
         with open(manifest) as f:
-            rows = list(csv.DictReader(f, delimiter="|"))
+            rows = list(_read_manifest(f))
         if limit:
             rows = rows[:limit]
 
-        lengths = self._load_or_build_lengths(manifest, rows, cache_lengths, limit)
+        frames, prefix = self._load_or_build_lengths(
+            manifest, rows, tokenizer, cache_lengths, limit
+        )
+        total = frames + prefix
 
         keep = [
             i
-            for i, n in enumerate(lengths)
+            for i, n in enumerate(frames)
             if n >= min_frames and n <= max_frames and n > 0
         ]
         self.rows = [rows[i] for i in keep]
-        self.lengths = [int(lengths[i]) for i in keep]
+        self.frames = [int(frames[i]) for i in keep]
+        # Batching must budget on the length the collator will actually pad to.
+        self.lengths = [int(total[i]) for i in keep]
         self.dropped = len(rows) - len(self.rows)
+        self.max_prefix = int(prefix.max()) if len(prefix) else 0
 
-    def _load_or_build_lengths(
-        self, manifest: str, rows: List[dict], cache: bool, limit: int
-    ) -> np.ndarray:
-        cache_path = f"{manifest}.lengths.npy"
+    def _load_or_build_lengths(self, manifest, rows, tokenizer, cache, limit):
+        """Return per-row (codec frames, style+text prefix tokens).
+
+        The prefix is measured rather than assumed because the batch sampler
+        budgets on it while the collator pads to it, and the two must agree.
+        On this corpus the style+text prefix runs 35 tokens at the median, 118
+        at p99.9 and 162 at maximum -- so a fixed 48-token estimate understates
+        the tail by ~3x and lets a batch exceed its token budget by ~20%.
+
+        (Before ``quoting=csv.QUOTE_NONE`` was applied to the manifest reader,
+        this tail appeared to reach 2219 tokens. That was 30 rows merged by the
+        csv module treating a literal ``"`` as a quote character, not a real
+        transcript -- see the module docstring.)
+
+        Style and text are tokenized once and cached next to the manifest.
+        """
+        cache_path = f"{manifest}.seqlen.npy"
         if cache and not limit and os.path.exists(cache_path):
             cached = np.load(cache_path)
-            if len(cached) == len(rows):
-                return cached
-        lengths = np.zeros(len(rows), dtype=np.int64)
+            if cached.shape == (len(rows), 2):
+                return cached[:, 0], cached[:, 1]
+
+        frames = np.zeros(len(rows), dtype=np.int64)
         for i, r in enumerate(rows):
             p = codec_path(r["name"], self.data_root)
-            lengths[i] = _npy_num_frames(p) if os.path.exists(p) else 0
+            frames[i] = _npy_num_frames(p) if os.path.exists(p) else 0
+
+        prefix = np.full(len(rows), DEFAULT_PREFIX_SLACK, dtype=np.int64)
+        if tokenizer is not None:
+            style = "<|lang_start|>en<|lang_end|><|instruct_start|>None<|instruct_end|>"
+            style_len = len(tokenizer(style).input_ids)
+            texts = [f"<|text_start|>{r['transcription']}<|text_end|>" for r in rows]
+            step = 2000
+            for i in range(0, len(texts), step):
+                enc = tokenizer(texts[i : i + step]).input_ids
+                for j, ids in enumerate(enc):
+                    prefix[i + j] = len(ids) + style_len
+
         if cache and not limit:
-            np.save(cache_path, lengths)
-        return lengths
+            np.save(cache_path, np.stack([frames, prefix], axis=1))
+        return frames, prefix
 
     @property
     def hours(self) -> float:
-        return sum(self.lengths) / FRAME_RATE / 3600.0
+        return sum(self.frames) / FRAME_RATE / 3600.0
 
     def __len__(self) -> int:
         return len(self.rows)
@@ -115,10 +157,10 @@ class LengthGroupedBatchSampler(torch.utils.data.Sampler):
         max_batch_size: int = 64,
         shuffle: bool = True,
         seed: int = 42,
-        prefix_slack: int = 48,
     ):
-        # Text/style prefix adds tokens the codec length does not account for.
-        self.lengths = [n + prefix_slack for n in lengths]
+        # `lengths` must already be the padded length the collator will produce
+        # (codec frames + style + text), not the codec length alone.
+        self.lengths = list(lengths)
         self.batch_tokens = batch_tokens
         self.max_batch_size = max_batch_size
         self.shuffle = shuffle
