@@ -27,6 +27,7 @@ Loss terms:
 """
 
 import math
+import random
 import time
 from dataclasses import dataclass, field
 from typing import Dict, Optional
@@ -111,23 +112,52 @@ def _hidden_match(student_hs, teacher_hs, projection: torch.Tensor, valid: torch
     return total / max(len(student_hs), 1)
 
 
+EVAL_SEED = 1234
+
+
 @torch.no_grad()
-def evaluate_loss(model, dataloader, device, max_batches: int = 0) -> float:
-    """Mean codebook-weighted CE on the dev set — the gate metric."""
+def evaluate_loss(
+    model, dataloader, device, max_batches: int = 0, seed: int = EVAL_SEED
+) -> float:
+    """Mean codebook-weighted CE on the dev set — the gate metric.
+
+    The RNG is pinned for the duration of the pass. ``OmniVoiceSampleProcessor``
+    redraws ``mask_ratio ~ U(0, 1)``, ``prompt_ratio`` and the per-token mask on
+    every ``__call__``, so without this the teacher's baseline (measured once at
+    startup) and the student's evals (at each checkpoint) land on *different*
+    noise levels. Measured across runs that moves the dev loss by up to 0.13
+    nats, several times the ~0.047 gap a 1% gate is trying to resolve, so the
+    gate would otherwise be comparing numbers below its own noise floor.
+
+    Both generators are restored afterwards: reseeding them permanently would
+    make every training batch after the first eval replay the same masks.
+
+    Requires ``num_workers=0``; masks drawn in worker processes are outside
+    this seeding.
+    """
+    py_state = random.getstate()
+    torch_state = torch.get_rng_state()
+    random.seed(seed)
+    torch.manual_seed(seed)
+
     was_training = model.training
     model.eval()
     w = _codebook_weights(model, device)
     total, count = 0.0, 0
-    for i, batch in enumerate(dataloader):
-        if max_batches and i >= max_batches:
-            break
-        batch = to_device(batch, device)
-        _, last = _hidden_states(model, batch, output_hidden_states=False)
-        loss = _weighted_ce(_audio_logits(model, last), batch["labels"], w)
-        total += float(loss)
-        count += 1
-    if was_training:
-        model.train()
+    try:
+        for i, batch in enumerate(dataloader):
+            if max_batches and i >= max_batches:
+                break
+            batch = to_device(batch, device)
+            _, last = _hidden_states(model, batch, output_hidden_states=False)
+            loss = _weighted_ce(_audio_logits(model, last), batch["labels"], w)
+            total += float(loss)
+            count += 1
+    finally:
+        random.setstate(py_state)
+        torch.set_rng_state(torch_state)
+        if was_training:
+            model.train()
     return total / max(count, 1)
 
 

@@ -287,7 +287,7 @@ def main(argv=None):
             f"      longest padded sequence in train: {max(train_ds.lengths)} tokens"
         )
 
-    def loader(ds, batch_tokens, shuffle):
+    def loader(ds, batch_tokens, shuffle, workers=None):
         return build_dataloader(
             ds,
             processor,
@@ -295,11 +295,13 @@ def main(argv=None):
             max_batch_size=args.max_batch_size,
             shuffle=shuffle,
             seed=args.seed,
-            num_workers=args.num_workers,
+            num_workers=args.num_workers if workers is None else workers,
         )
 
     calib_loader = loader(calib_ds, args.calib_batch_tokens, False)
-    dev_loader = loader(dev_ds, args.calib_batch_tokens, False)
+    # num_workers=0: evaluate_loss pins the RNG so every eval sees identical
+    # masks, and worker processes draw outside that seeding.
+    dev_loader = loader(dev_ds, args.calib_batch_tokens, False, workers=0)
     train_loader = (
         None if train_ds is None else loader(train_ds, args.batch_tokens, True)
     )
