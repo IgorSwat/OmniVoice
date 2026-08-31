@@ -125,6 +125,19 @@ def parse_args(argv=None):
     )
     g.add_argument("--no-rms-rescale", action="store_true")
     g.add_argument("--skip-roundtrip-check", action="store_true")
+    g.add_argument(
+        "--splits",
+        type=int,
+        nargs="*",
+        default=[],
+        help="layer indices that start a new block (section 7). Each block gets "
+        "its own Q and a [k, k] adapter reconciles the residual stream at each "
+        "junction. '--splits 21' costs 0.5M params (0.12%% of a 704-wide "
+        "student) and ~0.3%% of forward compute, and lifts worst-boundary "
+        "retention at k=704 from 0.9353 to 0.9542; '--splits 21 25' reaches "
+        "0.9642. Empty (default) = one global Q, and the student stays a stock "
+        "Qwen3Model.",
+    )
 
     g = p.add_argument_group("repair")
     g.add_argument("--repair-mode", default="sequential", choices=["sequential", "joint", "none"])
@@ -354,17 +367,35 @@ def main(argv=None):
         moments.save(os.path.join(rung_dir, "moments.pt"))
         diag = report_spectrum(moments, k, tag=f"d={d}")
 
-        print("[2/5] building Q and truncating")
-        Q = build_q(moments, args, k)
-        ret = calibration.retention(moments, Q, k)
+        n_layers = student.config.llm_config.num_hidden_layers
+        ranges = surgery.block_layer_ranges(args.splits, n_layers)
+        print(f"[2/5] building Q and truncating ({len(ranges)} block(s), "
+              f"{len(ranges) - 1} adapter(s))")
+        Qs, rets = [], []
+        for lo, hi in ranges:
+            bnds = surgery.block_boundaries(lo, hi, moments.num_boundaries)
+            Qb = build_q(moments, args, k) if len(ranges) == 1 else \
+                calibration.compute_rotation(
+                    moments, trace_normalize=not args.no_trace_normalize,
+                    boundaries=bnds)
+            Qs.append(Qb)
+            rets.append(calibration.retention(moments, Qb, k)[bnds])
+            if len(ranges) > 1:
+                print(f"    block layers {lo}-{hi} (boundaries {bnds[0]}-{bnds[-1]}): "
+                      f"min retention {rets[-1].min():.4f}")
+        ret = np.concatenate(rets) if len(ranges) > 1 else calibration.retention(moments, Qs[0], k)
         print(
-            f"  global-Q retention @k={k}: min {ret.min():.4f}  median "
-            f"{np.median(ret):.4f}  (worst boundary {int(ret.argmin())})"
+            f"  retention @k={k}: min {ret.min():.4f}  median {np.median(ret):.4f}"
         )
 
         pre_cut = copy.deepcopy(student)
         pre_cut.eval()
-        surgery.prune_width(student, Q, k, rms_rescale=not args.no_rms_rescale)
+        adapters = surgery.prune_width_blocks(
+            student, Qs, ranges, k, rms_rescale=not args.no_rms_rescale
+        )
+        if adapters:
+            print(f"  installed {len(adapters)} adapter(s) at layers "
+                  f"{sorted(adapters)} ({k * k / 1e6:.2f}M params each)")
         n_params = surgery.count_parameters(student)
         print(
             f"  student now hidden_size={k}  params={n_params / 1e6:.1f}M "
@@ -379,8 +410,9 @@ def main(argv=None):
                 student,
                 calib_loader,
                 device,
-                Q,
+                Qs if len(Qs) > 1 else Qs[0],
                 k,
+                ranges=ranges,
                 mode=args.repair_mode,
                 positions=args.repair_positions,
                 ridge_rel=args.repair_ridge,
@@ -398,7 +430,11 @@ def main(argv=None):
             f"{100 * (post_surgery_dev - teacher_dev) / teacher_dev:+.1f}%)"
         )
 
-        projection = Q[:, :k] if projection is None else projection @ Q[:, :k]
+        # Hidden-state matching maps the teacher's stream into the student's.
+        # With blocks each boundary has its own basis, so only the last block's
+        # is a single global map; fall back to it and note the approximation.
+        Qref = Qs[-1]
+        projection = Qref[:, :k] if projection is None else projection @ Qref[:, :k]
 
         recovery = {}
         if not args.skip_recovery:
@@ -441,7 +477,9 @@ def main(argv=None):
 
         surgery.save_pruned(student, rung_dir, tokenizer)
         torch.save(
-            {"Q": Q, "k": k, "projection": projection},
+            {"Q": Qs[0] if len(Qs) == 1 else Qs, "k": k, "ranges": ranges,
+             "splits": list(args.splits), "projection": projection,
+             "adapters": {i: a for i, a in adapters.items()} if adapters else {}},
             os.path.join(rung_dir, "rotation.pt"),
         )
 
@@ -450,6 +488,8 @@ def main(argv=None):
                 "k": k,
                 "from": d,
                 "params": n_params,
+                "splits": list(args.splits),
+                "num_adapters": len(ranges) - 1,
                 "retention_min": float(ret.min()),
                 "retention_median": float(np.median(ret)),
                 "retention_per_boundary": ret.tolist(),

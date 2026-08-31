@@ -104,7 +104,7 @@ def _collect(
     student,
     dataloader,
     device,
-    Qk: Optional[torch.Tensor],
+    qk_map: Dict[str, Optional[torch.Tensor]],
     modules: List[Tuple[str, torch.nn.Module, torch.nn.Module]],
     positions: str,
     max_batches: int,
@@ -112,10 +112,11 @@ def _collect(
 ) -> Dict[str, _Accumulator]:
     """One paired pass, hooking student inputs and teacher outputs.
 
-    ``modules`` is a list of ``(name, teacher_module, student_module)``. Teacher
-    outputs are projected by ``Qk`` (write-side rotation) before being used as
-    targets; pass ``Qk=None`` when the output dimension is unchanged, as for
-    ``audio_heads``.
+    ``modules`` is a list of ``(name, teacher_module, student_module)``. Each
+    teacher output is projected by that module's own write-side rotation before
+    being used as a target — with block grouping different layers live in
+    different bases. A ``None`` entry means the output dimension is unchanged,
+    as for ``audio_heads``.
     """
     from .calibration import _hidden_states
 
@@ -141,7 +142,8 @@ def _collect(
     accs: Dict[str, _Accumulator] = {}
     # Project teacher outputs on-device in float32: MPS has no float64, and the
     # accumulator casts to float64 only after the reduction (see _Accumulator.add).
-    Qk_dev = None if Qk is None else Qk.float().to(device)
+    qk_dev = {n: (None if q is None else q.float().to(device))
+              for n, q in qk_map.items()}
     try:
         for i, batch in enumerate(dataloader):
             if max_batches and i >= max_batches:
@@ -159,8 +161,9 @@ def _collect(
             for name, _, sm in modules:
                 x = cache[name]["x"][mask]
                 y = cache[name]["y"][mask]
-                if Qk_dev is not None:
-                    y = y.float() @ Qk_dev
+                qk = qk_dev.get(name)
+                if qk is not None:
+                    y = y.float() @ qk
                 if name not in accs:
                     accs[name] = _Accumulator(x.shape[-1], y.shape[-1])
                 accs[name].add(x, y)
@@ -183,8 +186,9 @@ def repair(
     student,
     dataloader,
     device,
-    Q: torch.Tensor,
+    Q,
     k: int,
+    ranges: Optional[List[Tuple[int, int]]] = None,
     mode: str = "sequential",
     positions: str = "all",
     ridge_rel: float = 1e-4,
@@ -210,9 +214,27 @@ def repair(
       student. Faster, but ignores that repairing layer ``l`` changes the inputs
       of layer ``l+1``. Holds all normal equations at once (~4 GB at d=1024).
 
+    ``Q`` is either a single ``[d, d]`` rotation or, with block grouping, a list
+    of one per block; ``ranges`` then gives each block's ``(first_layer,
+    last_layer)`` so every module is repaired against its own basis.
+
     Returns a report mapping module name to before/after relative error.
     """
-    Qk = Q[:, :k].detach().cpu().double()
+    Qlist = Q if isinstance(Q, (list, tuple)) else [Q]
+    if ranges is None:
+        ranges = [(0, len(student.llm.layers) - 1)]
+    Qks = [q[:, :k].detach().cpu().double() for q in Qlist]
+
+    def qk_of_layer(i):
+        for b, (lo, hi) in enumerate(ranges):
+            if lo <= i <= hi:
+                return Qks[b]
+        return Qks[-1]
+
+    def qk_of_name(name):
+        if name == "audio_heads":
+            return None            # output dimension unchanged
+        return qk_of_layer(int(name.split(".")[1]))
     teacher.eval()
     student.eval()
     report: Dict[str, dict] = {}
@@ -247,7 +269,8 @@ def repair(
             for name, _ in _write_targets(student)
         ]
         accs = _collect(
-            teacher, student, dataloader, device, Qk, mods, positions, max_batches
+            teacher, student, dataloader, device,
+            {n: qk_of_name(n) for n, _, _ in mods}, mods, positions, max_batches
         )
         for name, _, _ in mods:
             _apply(name, accs[name])
@@ -261,7 +284,8 @@ def repair(
                 for n in names
             ]
             accs = _collect(
-                teacher, student, dataloader, device, Qk, mods, positions, max_batches
+                teacher, student, dataloader, device,
+                {n: qk_of_name(n) for n in names}, mods, positions, max_batches
             )
             for n in names:
                 _apply(n, accs[n])
@@ -279,7 +303,7 @@ def repair(
             student,
             dataloader,
             device,
-            None,
+            {"audio_heads": None},
             mods,
             positions,
             max_batches,

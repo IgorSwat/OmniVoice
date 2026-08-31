@@ -302,3 +302,121 @@ def save_pruned(model, out_dir: str, tokenizer=None) -> None:
 
 def count_parameters(model) -> int:
     return sum(p.numel() for p in model.parameters())
+
+
+# --------------------------------------------------------------------------
+# Block grouping (section 7): per-block Q with adapters at the junctions
+# --------------------------------------------------------------------------
+
+
+def block_layer_ranges(splits, num_layers: int):
+    """``[21]`` -> ``[(0, 20), (21, 27)]``. Splits are the first layer of a block."""
+    edges = [0] + sorted(int(s) for s in splits) + [num_layers]
+    return [(edges[i], edges[i + 1] - 1) for i in range(len(edges) - 1)]
+
+
+def block_boundaries(lo: int, hi: int, num_boundaries: int):
+    """Residual boundaries a layer block touches: it reads ``lo..hi`` and writes ``hi+1``.
+
+    Blocks overlap by one boundary at each junction on purpose — the shared
+    boundary is where the adapter converts between bases, so both neighbouring
+    bases should represent it well.
+    """
+    return list(range(lo, min(hi + 2, num_boundaries)))
+
+
+def _fold_block(model, layers, Qk, scale):
+    with torch.no_grad():
+        for layer in layers:
+            for m in (layer.self_attn.q_proj, layer.self_attn.k_proj,
+                      layer.self_attn.v_proj, layer.mlp.gate_proj, layer.mlp.up_proj):
+                _set_linear(m, (_f64(m.weight) @ Qk) * scale)
+            for m in (layer.self_attn.o_proj, layer.mlp.down_proj):
+                _set_linear(m, Qk.T @ _f64(m.weight))
+            _set_norm(layer.input_layernorm, Qk.shape[1])
+            _set_norm(layer.post_attention_layernorm, Qk.shape[1])
+
+
+class _AdapterPreHook:
+    """Applies a residual-stream basis change to a decoder layer's input.
+
+    A pre-hook rather than a wrapper module: `Qwen3Model.forward` reaches into
+    its layers for attributes like `attention_type`, and wrapping would hide
+    them. The adapter itself is registered on the model as `width_adapters` so
+    it is a real parameter — trainable during recovery and saved in the
+    state dict.
+    """
+
+    def __init__(self, adapter):
+        self.adapter = adapter
+
+    def __call__(self, module, args, kwargs):
+        if args:
+            return (self.adapter(args[0]),) + tuple(args[1:]), kwargs
+        kwargs = dict(kwargs)
+        kwargs["hidden_states"] = self.adapter(kwargs["hidden_states"])
+        return args, kwargs
+
+
+def install_adapters(model, adapters):
+    """``adapters``: ``{first_layer_of_block: [k, k] matrix}``, applied to its input."""
+    ref = model.llm.layers[0].self_attn.q_proj.weight
+    mods = nn.ModuleList()
+    for _, A in sorted(adapters.items()):
+        lin = nn.Linear(A.shape[1], A.shape[0], bias=False)
+        with torch.no_grad():
+            lin.weight.copy_(A.to(dtype=ref.dtype))
+        mods.append(lin.to(device=ref.device, dtype=ref.dtype))
+    model.width_adapters = mods
+    handles = []
+    for i, li in enumerate(sorted(adapters)):
+        handles.append(
+            model.llm.layers[li].register_forward_pre_hook(
+                _AdapterPreHook(model.width_adapters[i]), with_kwargs=True
+            )
+        )
+    model._adapter_layers = sorted(adapters)
+    model._adapter_handles = handles
+    return model.width_adapters
+
+
+def reinstall_adapters(model):
+    """Re-attach hooks after loading a checkpoint that already carries adapters."""
+    if not hasattr(model, "width_adapters"):
+        return
+    for i, li in enumerate(model._adapter_layers):
+        model.llm.layers[li].register_forward_pre_hook(
+            _AdapterPreHook(model.width_adapters[i]), with_kwargs=True
+        )
+
+
+def prune_width_blocks(model, Qs, ranges, k, rms_rescale=True, fold_gains=True):
+    """Fold one basis per contiguous layer block and truncate to ``k``.
+
+    ``Qs[b]`` is the full ``[d, d]`` rotation for the layers in ``ranges[b]``.
+    Embeddings write the stream in block 0's basis; ``audio_heads`` reads it in
+    the last block's. At each junction an adapter converts the residual stream
+    from the previous basis to the next: ``A = Q_next[:, :k]^T @ Q_prev[:, :k]``.
+
+    With one block this is exactly :func:`apply_rotation`.
+    """
+    if fold_gains and not gains_are_folded(model):
+        fold_rmsnorm_gains(model)
+    d = model.config.llm_config.hidden_size
+    scale = math.sqrt(d / k) if rms_rescale else 1.0
+    Qks = [_f64(Q[:, :k]) for Q in Qs]
+
+    with torch.no_grad():
+        for mod in _stream_embeddings(model):          # written in block 0's basis
+            _set_embedding(mod, _f64(mod.weight) @ Qks[0])
+        for b, (lo, hi) in enumerate(ranges):
+            _fold_block(model, model.llm.layers[lo:hi + 1], Qks[b], scale)
+        _set_linear(model.audio_heads,                 # reads the last block's basis
+                    (_f64(model.audio_heads.weight) @ Qks[-1]) * scale)
+        _set_norm(model.llm.norm, k)
+
+    adapters = {ranges[b][0]: (Qks[b].T @ Qks[b - 1]) for b in range(1, len(ranges))}
+    _set_hidden_size(model, k)
+    if adapters:
+        install_adapters(model, adapters)
+    return adapters
