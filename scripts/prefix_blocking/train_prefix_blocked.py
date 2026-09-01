@@ -73,15 +73,27 @@ class ClonePairDataset(Dataset):
     """
 
     def __init__(self, manifest, data_root="data", ref_manifest=None,
-                 min_frames=50, max_frames=750, ref_cap=150, limit=0):
-        rows = read_manifest(manifest)
+                 min_frames=50, max_frames=750, ref_cap=150, limit=0,
+                 only_speakers=None, exclude_speakers=None):
+        rows = manifest if isinstance(manifest, list) else read_manifest(manifest)
         if limit:
             rows = rows[:limit]
-        # References may come from a different split. The dev set has only two
-        # speakers with a repeated utterance, so pairing it against itself yields
-        # four evaluable targets; drawing references from the training split
-        # keeps every dev target usable while the target audio stays held out.
-        ref_rows = read_manifest(ref_manifest) if ref_manifest else rows
+        # References may come from a different split -- most dev speakers have a
+        # single utterance, so pairing the dev set against itself yields almost
+        # no evaluable targets. The reference pool therefore holds the *other*
+        # utterances by the same speakers, which the speaker holdout has removed
+        # from training (see --no-speaker-holdout).
+        if ref_manifest is None:
+            ref_rows = rows
+        else:
+            ref_rows = (ref_manifest if isinstance(ref_manifest, list)
+                        else read_manifest(ref_manifest))
+        if only_speakers is not None:
+            rows = [r for r in rows if r["speaker_id"] in only_speakers]
+            ref_rows = [r for r in ref_rows if r["speaker_id"] in only_speakers]
+        if exclude_speakers:
+            rows = [r for r in rows if r["speaker_id"] not in exclude_speakers]
+            ref_rows = [r for r in ref_rows if r["speaker_id"] not in exclude_speakers]
         by_spk = defaultdict(list)
         for r in ref_rows:
             by_spk[r["speaker_id"]].append(r)
@@ -236,26 +248,42 @@ def to_device(batch, device):
 
 
 @torch.no_grad()
-def evaluate(student, teacher, loader, device, w, seed=1234):
-    """Teacher-forced CE for both models. RNG pinned so evals are comparable."""
+def evaluate(student, teacher, loader, device, w, seed=1234, max_batches=0):
+    """Held-out CE for both models plus the student's KL to the teacher.
+
+    KL is the metric that actually moves: measured on this checkpoint, CE
+    separates teacher-full / teacher-blocked / student-blocked by under 0.4%,
+    while KL separates them by 2-3x. Reading CE alone makes a working run and a
+    dead one look identical.
+
+    RNG is pinned and restored so the random mask ratios are the same at every
+    eval, making successive numbers comparable.
+    """
     py, th = random.getstate(), torch.get_rng_state()
     random.seed(seed)
     torch.manual_seed(seed)
     student.eval()
-    tot_s = tot_t = n = 0.0
+    tot_s = tot_t = tot_kl = 0.0
+    n = 0
     try:
-        for batch in loader:
+        for i, batch in enumerate(loader):
+            if max_batches and i >= max_batches:
+                break
             batch = to_device(batch, device)
             full = build_masks(batch["valid"], batch["prefix_len"], False)
             blocked = build_masks(batch["valid"], batch["prefix_len"], True)
-            tot_t += float(weighted_ce(logits_of(teacher, batch, full), batch["labels"], w))
-            tot_s += float(weighted_ce(logits_of(student, batch, blocked), batch["labels"], w))
+            t_logits = logits_of(teacher, batch, full)
+            s_logits = logits_of(student, batch, blocked)
+            tot_t += float(weighted_ce(t_logits, batch["labels"], w))
+            tot_s += float(weighted_ce(s_logits, batch["labels"], w))
+            tot_kl += float(weighted_kd(s_logits, t_logits, batch["labels"], w))
             n += 1
     finally:
         random.setstate(py)
         torch.set_rng_state(th)
         student.train()
-    return tot_s / max(n, 1), tot_t / max(n, 1)
+    d = max(n, 1)
+    return tot_s / d, tot_t / d, tot_kl / d
 
 
 def lr_at(step, steps, lr, warmup=0.03, min_ratio=0.1):
@@ -282,6 +310,10 @@ def main():
                         "manifest). Dev targets stay held out; only the reference "
                         "voice comes from the training split.")
     p.add_argument("--data-root", default="data")
+    p.add_argument("--no-speaker-holdout", dest="speaker_holdout",
+                   action="store_false",
+                   help="keep dev speakers in training (the old behaviour): "
+                        "validation then measures utterance generalisation only")
     p.add_argument("--out-dir", required=True)
     p.add_argument("--device", default=None)
     p.add_argument("--dtype", default="fp32", choices=list(DTYPES))
@@ -295,6 +327,11 @@ def main():
     p.add_argument("--weight-decay", type=float, default=0.01)
     p.add_argument("--max-grad-norm", type=float, default=1.0)
     p.add_argument("--temperature", type=float, default=1.0)
+    p.add_argument("--kd-weight", type=float, default=1.0)
+    p.add_argument("--ce-weight", type=float, default=0.0,
+                   help="ground-truth CE, added to the KD term. CE is ~40x "
+                        "larger than KD here, so useful values are small; "
+                        "see probe_loss_balance.py")
     p.add_argument("--grad-checkpointing", action="store_true")
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--log-every", type=int, default=25)
@@ -335,18 +372,45 @@ def main():
     w = torch.tensor(student.normalized_audio_codebook_weights, device=device)
     coll = CloneCollator(tok, C, student.config.audio_mask_id)
 
-    def make(manifest, shuffle, workers, ref_manifest=None):
+    def make(manifest, shuffle, workers, ref_manifest=None, **kw):
         ds = ClonePairDataset(manifest, args.data_root, ref_manifest=ref_manifest,
-                              max_frames=args.max_frames, ref_cap=args.ref_cap)
+                              max_frames=args.max_frames, ref_cap=args.ref_cap, **kw)
         return ds, DataLoader(ds, batch_size=args.batch_size, shuffle=shuffle,
                               collate_fn=coll, num_workers=workers, drop_last=shuffle)
 
-    train_ds, train_dl = make(args.train_manifest, True, args.num_workers)
+    # `dataset_without_dev.csv` removes the dev *utterances* but keeps their
+    # speakers: every one of the 218 dev speakers still has other utterances in
+    # train (median 13). That makes the default split utterance-held-out, which
+    # cannot answer the question this model is judged on -- can it clone a voice
+    # it has never heard? This model has no speaker embedding and no speaker ID
+    # token, so a voice seen 13 times in training is exactly where timbre could
+    # have been absorbed into the weights unnoticed.
+    #
+    # Holding out speakers moves those utterances from training into the
+    # validation reference pool, so validation targets AND their reference clips
+    # are both from voices the student never saw.
+    val_speakers = None
+    ref_rows = read_manifest(args.dev_ref_manifest or args.train_manifest)
+    if args.speaker_holdout:
+        val_speakers = {r["speaker_id"] for r in read_manifest(args.dev_manifest)}
+        ref_rows = [r for r in ref_rows if r["speaker_id"] in val_speakers]
+
+    train_ds, train_dl = make(args.train_manifest, True, args.num_workers,
+                              exclude_speakers=val_speakers)
     dev_ds, dev_dl = make(args.dev_manifest, False, 0,
-                          ref_manifest=args.dev_ref_manifest or args.train_manifest)
-    print(f"train pairs {len(train_ds)}   dev pairs {len(dev_ds)}")
+                          ref_manifest=read_manifest(args.dev_manifest) + ref_rows)
+    print(f"train pairs {len(train_ds)}   val pairs {len(dev_ds)}")
+    if args.speaker_holdout:
+        full_n = len(read_manifest(args.train_manifest))
+        print(f"speaker holdout: {len(val_speakers)} validation speakers, "
+              f"{full_n - len(train_ds.rows)} training rows withheld "
+              f"({(full_n - len(train_ds.rows))/full_n*100:.1f}%); "
+              f"validation voices are unseen in training")
+    else:
+        print("WARNING: --no-speaker-holdout -- validation speakers also appear "
+              "in training, so validation measures utterance generalisation only")
     if len(dev_ds) == 0:
-        raise SystemExit("no dev target has a same-speaker reference available")
+        raise SystemExit("no validation target has a same-speaker reference available")
 
     params = [q for q in student.parameters() if q.requires_grad]
     decay = [q for q in params if q.ndim > 1]
@@ -356,12 +420,13 @@ def main():
          {"params": nodecay, "weight_decay": 0.0}], lr=args.lr, betas=(0.9, 0.95))
     amp = device.type == "cuda"
 
-    s0, t0 = evaluate(student, teacher, dev_dl, device, w, )
-    print(f"before training: student(blocked) CE {s0:.4f}   teacher(full) CE {t0:.4f}"
-          f"   gap {s0 - t0:+.4f}")
+    s0, t0, k0 = evaluate(student, teacher, dev_dl, device, w,
+                          max_batches=args.eval_batches)
+    print(f"before training: val KL {k0:.4f}   student(blocked) CE {s0:.4f}   "
+          f"teacher(full) CE {t0:.4f}   gap {s0 - t0:+.4f}")
 
     step = micro = 0
-    run = 0.0
+    run = run_kd = run_ce = 0.0
     it = iter(train_dl)
     start = time.time()
     while step < args.steps:
@@ -378,10 +443,17 @@ def main():
             with torch.no_grad():
                 t_logits = logits_of(teacher, batch, full)
             s_logits = logits_of(student, batch, blocked)
-            loss = weighted_kd(s_logits, t_logits, batch["labels"], w, args.temperature)
+            kd = weighted_kd(s_logits, t_logits, batch["labels"], w, args.temperature)
+            # Ground-truth CE anchors the student to the data, so it cannot inherit
+            # teacher quirks wholesale. Secondary by design -- see --ce-weight.
+            ce = (weighted_ce(s_logits, batch["labels"], w)
+                  if args.ce_weight > 0 else torch.zeros((), device=device))
+            loss = args.kd_weight * kd + args.ce_weight * ce
 
         (loss / args.grad_accum).backward()
         run += float(loss.detach())
+        run_kd += float(kd.detach())
+        run_ce += float(ce.detach())
         micro += 1
         if micro % args.grad_accum:
             continue
@@ -397,20 +469,25 @@ def main():
         if args.log_every and step % args.log_every == 0:
             peak = (f"  peak {torch.cuda.max_memory_allocated()/2**30:.1f}GiB"
                     if device.type == "cuda" else "")
-            print(f"  step {step}/{args.steps}  kd {run/(args.log_every*args.grad_accum):.4f}"
+            d = args.log_every * args.grad_accum
+            print(f"  step {step}/{args.steps}  loss {run/d:.4f}"
+                  f"  kd {run_kd/d:.4f}  ce {run_ce/d:.4f}"
                   f"  lr {lr_at(step, args.steps, args.lr):.2e}"
                   f"  {step/max(time.time()-start,1e-6):.2f} step/s{peak}", flush=True)
-            run = 0.0
+            run = run_kd = run_ce = 0.0
         if args.eval_every and step % args.eval_every == 0:
-            s, t = evaluate(student, teacher, dev_dl, device, w)
-            print(f"  step {step}: student(blocked) CE {s:.4f}  teacher(full) CE {t:.4f}"
+            s, t, k = evaluate(student, teacher, dev_dl, device, w,
+                               max_batches=args.eval_batches)
+            print(f"  step {step}: val KL {k:.4f} (init {k0:.4f})  "
+                  f"student(blocked) CE {s:.4f}  teacher(full) CE {t:.4f}"
                   f"  gap {s - t:+.4f}", flush=True)
         if args.save_every and step % args.save_every == 0:
             student.save_pretrained(os.path.join(args.out_dir, f"step_{step}"))
 
-    s, t = evaluate(student, teacher, dev_dl, device, w)
-    print(f"\nfinal: student(blocked) CE {s:.4f}  teacher(full) CE {t:.4f}  gap {s - t:+.4f}"
-          f"   (was {s0 - t0:+.4f} before training)")
+    s, t, k = evaluate(student, teacher, dev_dl, device, w,
+                       max_batches=args.eval_batches)
+    print(f"\nfinal: val KL {k:.4f} (was {k0:.4f})  student(blocked) CE {s:.4f}  "
+          f"teacher(full) CE {t:.4f}  gap {s - t:+.4f} (was {s0 - t0:+.4f})")
     student.save_pretrained(args.out_dir)
     tok.save_pretrained(args.out_dir)
     print(f"saved {args.out_dir}")
