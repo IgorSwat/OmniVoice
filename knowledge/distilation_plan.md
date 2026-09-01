@@ -286,7 +286,7 @@ End-to-end FLOPs for one 10s generation with a 5s reference (P=200 prefix, T=250
 |---|---|---|---|
 | Teacher: 32 steps + CFG, full attention | 28,340 | 1.00× | — |
 | **+ model size** (d704 / L20 / I1536 / groups 8→6) | 9,067 | 3.13× | 3.13× |
-| **+ 16 steps** (`t_shift=0.2`) | 4,533 | 6.25× | 2.00× |
+| **+ 16 steps** (`t_shift=0.1`, stock — measured free ✅) | 4,533 | 6.25× | 2.00× |
 | **+ CFG eliminated** (guidance distillation) | 2,267 | 12.50× | **2.00×** ✅ |
 | **+ prefix K/V blocking** | 1,316 | **21.53×** | 1.72× |
 | + hybrid sliding window (4 of 20 full, W=256) | 1,240 | 22.86× | 1.06× |
@@ -309,21 +309,46 @@ n=16, t_shift=0.1:  per-step [0.0066, 0.0075, ...] ... last step 0.400
 ```
 
 The failure mode of parallel unmasking is a **conditional-independence violation**: committing
-`k` tokens in one step samples from the product of marginals, not the joint. The 0.244 → 0.400
-jump is where quality goes — not general model inaccuracy.
+`k` tokens in one step samples from the product of marginals, not the joint.
 
-Sweeping `t_shift` at n=16:
-
-| `t_shift` | max per-step | first step |
-|---|---|---|
-| 0.1 | 0.400 | 0.0066 |
-| **0.2** | **0.250** | 0.0132 |
-| 0.3 | 0.182 | 0.0196 |
-| 0.5 | 0.118 | 0.0323 |
-
-**`t_shift=0.2` at 16 steps reproduces the 32-step maximum parallel-commit fraction almost
-exactly** (0.250 vs 0.244). One config field, zero training. **Run this on the teacher first** —
-it tells you how much of the 32→16 gap is schedule shape versus genuine model capacity.
+> ### ✅ MEASURED — and this section's original recommendation was wrong
+>
+> An earlier version of this document recommended `t_shift=0.2` at 16 steps, on the grounds that
+> it reproduces the 32-step **maximum** parallel-commit fraction (0.250 vs 0.244). Measured on the
+> teacher (`scripts/step_reduction/wer_sweep.py`, 9 speakers × 9 targets = 81 utterances per arm,
+> 2,340 reference words, Whisper `large-v3-turbo` + `EnglishTextNormalizer`):
+>
+> | schedule | tokens committed, **first 4 steps** | terminal commit | **WER** | RTF |
+> |---|---|---|---|---|
+> | 32 steps, `t_shift=0.1` *(baseline)* | 30 | 473 | **0.00%** | 0.805 |
+> | **16 steps, `t_shift=0.1` (stock default)** | **66** | **793** | **0.00%** | **0.418** |
+> | 16 steps, `t_shift=0.15` | 97 | 608 | 0.09% | 0.417 |
+> | 16 steps, `t_shift=0.2` *(was recommended)* | 127 | 493 | 0.34% | 0.414 |
+> | 16 steps, `t_shift=0.25` | 156 | 414 | 0.47% | 0.422 |
+> | 16 steps, `t_shift=0.3` | 184 | 354 | 0.56% | 0.427 |
+> | 16 steps, `t_shift=0.4` | 237 | 279 | 1.67% | 0.420 |
+> | 16 steps, `t_shift=0.5` | 287 | 228 | 3.33% | 0.439 |
+>
+> **Leave `t_shift` at its default of 0.1.** WER rises monotonically with it — by `t_shift=0.5` it
+> is 10× the `t_shift=0.2` figure. At the stock default, 16 steps is **indistinguishable from the
+> 32-step baseline**: 0 errors in 2,340 words in both arms, and 9/9 ties in a blind paired
+> listening test (7 rows at maximum confidence, with the two sub-threshold leans pointing in
+> opposite directions). **1.93× for one config field.**
+>
+> **"Max per-step commit fraction" is the wrong diagnostic — it is anti-correlated with quality.**
+> The arm with the largest terminal dump in the entire grid (793 tokens at once) is one of the two
+> that score zero. The predictive statistic is the **early**-step commit size, which tracks WER
+> monotonically across all eight arms.
+>
+> The reason is the parenthetical below, which the original recommendation contradicted:
+> `layer_penalty_factor=5.0` makes the early steps decide codebooks 0/1 — the coarse content that
+> everything downstream conditions on — while the terminal dump is acoustic residual that is nearly
+> deterministic given the lower codebooks. Raising `t_shift` flattens the schedule and thereby
+> **enlarges exactly the commits that matter**. The back-loading is not a flaw to correct; it is
+> the mechanism that makes step reduction work.
+>
+> ⚠️ Scope: English, 9 held-out speakers, 1 seed per cell. Zero errors in 81 utterances bounds the
+> defect rate at <3.7% (rule of three), not at zero.
 
 (The back-loading is deliberate and fine at 32 steps: `layer_penalty_factor=5.0` forces codebooks
 0/1 to resolve during the early fine-grained steps, so the terminal dump is mostly high codebooks
@@ -435,7 +460,7 @@ Only worth the risk at long outputs — it adds just 1.06× at S=450.
 ### 5.6 Free levers, no training
 
 - **Vocab pruning** — 78.6M params, exactly lossless for unused tokens
-- **`t_shift=0.2`** — the enabler for 16 steps
+- **16 steps at the stock `t_shift=0.1`** — measured free (0.00% WER, 9/9 blind ties, 1.93×) ✅
 - **Codec decoder-only deployment** — 201M → 21.6M, verified bit-identical ✅
 - **Precomputed voice prompts** — drops 160M encoder + ~800M Whisper from the device
 - **Shorter reference audio** — P scales with it; 3s vs 8s is real compute
@@ -1157,7 +1182,8 @@ Quick-reference table of everything measured against the local checkpoint. ✅
 | 16k-upsampled >8 kHz energy | **exactly 0.0** |
 | mel-L1: native / lossless-control / 48k / 16k / 8k | 0.645 / 0.675 / 0.696 / 1.078 / 1.911 |
 | Resample peak on 0 dBFS source | 1.001 (clips) |
-| `t_shift` max per-step: n=32@0.1 vs n=16@0.2 | 0.244 vs 0.250 |
+| WER, 32 steps vs 16 steps, both `t_shift=0.1` | 0.00% vs 0.00% (0/2340 words each) ✅ |
+| WER at 16 steps, `t_shift` 0.1 / 0.2 / 0.3 / 0.5 | 0.00% / 0.34% / 0.56% / 3.33% ✅ |
 | Qwen3 tokenizer by script (Latin/CJK/mixed) | 76054 / 25464 / 19258 of 151676 |
 | Prefix blocking, P=200 T=250 N=16 | 135.5G → 78.7G = **1.72×** |
 
@@ -1199,8 +1225,9 @@ Once CFG is distilled away, run evals with `guidance_scale=0`.
 
 ### Immediately — zero training data
 
-1. **`t_shift=0.2` sweep on the teacher at 16 steps.** Zero data, minutes. Tells you how much of
-   the 32→16 gap is schedule shape vs. model capacity, which sets how hard Phase D has to work.
+1. ~~**`t_shift=0.2` sweep on the teacher at 16 steps.**~~ **DONE ✅** — and it inverted: leave
+   `t_shift` at 0.1. There is no 32→16 gap to close at the stock default (0.00% WER both arms,
+   9/9 blind ties, 1.93×), so Phase D starts from parity rather than from a known deficit. See §5.1.
 2. **Prefix-blocking mask on the teacher.** Zero training. Validates a 1.72× before you commit.
 
 These two are the highest value-per-hour in the plan — pure measurement on the existing teacher,
