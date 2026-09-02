@@ -47,7 +47,7 @@ from omnivoice.models.omnivoice import (  # noqa: E402
     _resolve_model_path,
     _tokenize_with_nonverbal_tags,
 )
-from p4_width_pruning.manifest import codec_path  # noqa: E402
+from p4_width_pruning.manifest import codec_path, _npy_num_frames  # noqa: E402
 
 DTYPES = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}
 
@@ -192,6 +192,119 @@ class CloneCollator:
         }
 
 
+# ---------------------------------------------------------------------------
+# Length-grouped batching
+# ---------------------------------------------------------------------------
+
+
+def row_stats(manifest, data_root, tokenizer, cache=True):
+    """``{name: (codec_frames, transcript_tokens)}``, cached beside the manifest.
+
+    Reading 300k `.npy` headers takes minutes, so the result is cached as
+    ``<manifest>.clonelen.npy``. The transcript is tokenised rather than estimated
+    from character count: on this corpus the text prefix runs ~35 tokens at the
+    median but 162 at maximum, so a flat estimate understates the tail badly
+    enough to blow a token budget it was supposed to enforce.
+    """
+    rows = read_manifest(manifest)
+    cache_path = f"{manifest}.clonelen.npy"
+    if cache and os.path.exists(cache_path):
+        c = np.load(cache_path)
+        if c.shape == (len(rows), 2):
+            return {r["name"]: (int(c[i, 0]), int(c[i, 1])) for i, r in enumerate(rows)}
+
+    frames = np.zeros(len(rows), dtype=np.int64)
+    for i, r in enumerate(rows):
+        q = codec_path(r["name"], data_root)
+        frames[i] = _npy_num_frames(q) if os.path.exists(q) else 0
+
+    toks = np.zeros(len(rows), dtype=np.int64)
+    texts = [r["transcription"] for r in rows]
+    for i in range(0, len(texts), 2000):
+        for j, ids in enumerate(tokenizer(texts[i : i + 2000]).input_ids):
+            toks[i + j] = len(ids)
+
+    if cache:
+        try:
+            np.save(cache_path, np.stack([frames, toks], axis=1))
+        except OSError:
+            pass
+    return {r["name"]: (int(frames[i]), int(toks[i])) for i, r in enumerate(rows)}
+
+
+def clone_pair_lengths(ds, stats, ref_cap, max_frames, style_tokens=24, slack=8):
+    """Upper bound on the padded length the collator will produce, per target.
+
+    The reference is redrawn at random every epoch, so the per-speaker MAXIMUM is
+    used for both its frames and its transcript. That is deliberately pessimistic:
+    the sampler budgets ``max_len * batch_size <= batch_tokens``, and the bound has
+    to hold for whichever reference actually gets drawn, or the batch it sized can
+    still OOM.
+    """
+    pool_frames, pool_toks = {}, {}
+    for spk, rs in ds.by_spk.items():
+        f = [min(stats.get(r["name"], (0, 0))[0], ref_cap) for r in rs]
+        t = [stats.get(r["name"], (0, 0))[1] for r in rs]
+        pool_frames[spk] = max(f) if f else ref_cap
+        pool_toks[spk] = max(t) if t else 0
+
+    out = []
+    for r in ds.targets:
+        tf, tt = stats.get(r["name"], (0, 0))
+        spk = r["speaker_id"]
+        out.append(style_tokens + tt + pool_toks.get(spk, 0)
+                   + pool_frames.get(spk, ref_cap) + min(tf, max_frames) + slack)
+    return out
+
+
+class LengthGroupedBatchSampler(torch.utils.data.Sampler):
+    """Groups similar-length samples so padding waste stays low.
+
+    Batches are capped by a token budget (``max_len * batch_size <= batch_tokens``)
+    rather than a fixed batch size. With a fixed size and random shuffling the
+    padded length is ``B * max(random draw)``, which has a heavy tail -- measured
+    on this corpus, 46% of every batch was padding at B=32 and the p99 batch was
+    ~30% larger than the mean. Sorting by length removes both.
+    """
+
+    def __init__(self, lengths, batch_tokens, max_batch_size=64, shuffle=True, seed=42):
+        self.lengths = list(lengths)
+        self.batch_tokens = batch_tokens
+        self.max_batch_size = max_batch_size
+        self.shuffle = shuffle
+        self.seed = seed
+        self.epoch = 0
+        self._batches = self._build()
+
+    def _build(self):
+        order = sorted(range(len(self.lengths)), key=lambda i: self.lengths[i])
+        batches, cur, cur_max = [], [], 0
+        for i in order:
+            nxt_max = max(cur_max, self.lengths[i])
+            if cur and (nxt_max * (len(cur) + 1) > self.batch_tokens
+                        or len(cur) + 1 > self.max_batch_size):
+                batches.append(cur)
+                cur, cur_max = [i], self.lengths[i]
+            else:
+                cur.append(i)
+                cur_max = nxt_max
+        if cur:
+            batches.append(cur)
+        return batches
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+
+    def __iter__(self):
+        batches = list(self._batches)
+        if self.shuffle:
+            random.Random(self.seed + self.epoch).shuffle(batches)
+        return iter(batches)
+
+    def __len__(self):
+        return len(self._batches)
+
+
 def build_masks(valid, prefix_len, block):
     """4D attention masks. `block` cuts prefix-query -> target-key edges only."""
     B, S = valid.shape
@@ -321,6 +434,12 @@ def main():
     p.add_argument("--ref-cap", type=int, default=150, help="reference frames (25/s)")
     p.add_argument("--max-frames", type=int, default=750)
     p.add_argument("--batch-size", type=int, default=8)
+    p.add_argument("--batch-tokens", type=int, default=0, metavar="N",
+                   help="length-grouped batching with a padded-token budget per "
+                        "batch (0 = fixed --batch-size). Memory scales with "
+                        "batch_size * max_len, so this is what actually bounds it.")
+    p.add_argument("--max-batch-size", type=int, default=128,
+                   help="cap on samples per batch when --batch-tokens is used")
     p.add_argument("--grad-accum", type=int, default=1)
     p.add_argument("--steps", type=int, default=2000)
     p.add_argument("--lr", type=float, default=5e-5)
@@ -375,8 +494,21 @@ def main():
     def make(manifest, shuffle, workers, ref_manifest=None, **kw):
         ds = ClonePairDataset(manifest, args.data_root, ref_manifest=ref_manifest,
                               max_frames=args.max_frames, ref_cap=args.ref_cap, **kw)
+        if args.batch_tokens > 0:
+            lengths = clone_pair_lengths(ds, row_stats(manifest, args.data_root, tok),
+                                         args.ref_cap, args.max_frames)
+            bs = LengthGroupedBatchSampler(lengths, args.batch_tokens,
+                                           max_batch_size=args.max_batch_size,
+                                           shuffle=shuffle, seed=args.seed)
+            sizes = [len(b) for b in bs]
+            print(f"  {os.path.basename(manifest)}: {len(bs)} length-grouped batches, "
+                  f"size {min(sizes)}-{max(sizes)} (mean {sum(sizes)/len(sizes):.1f}), "
+                  f"<= {args.batch_tokens} padded tokens each")
+            return ds, DataLoader(ds, batch_sampler=bs, collate_fn=coll,
+                                  num_workers=workers), bs
         return ds, DataLoader(ds, batch_size=args.batch_size, shuffle=shuffle,
-                              collate_fn=coll, num_workers=workers, drop_last=shuffle)
+                              collate_fn=coll, num_workers=workers,
+                              drop_last=shuffle), None
 
     # `dataset_without_dev.csv` removes the dev *utterances* but keeps their
     # speakers: every one of the 218 dev speakers still has other utterances in
@@ -395,10 +527,10 @@ def main():
         val_speakers = {r["speaker_id"] for r in read_manifest(args.dev_manifest)}
         ref_rows = [r for r in ref_rows if r["speaker_id"] in val_speakers]
 
-    train_ds, train_dl = make(args.train_manifest, True, args.num_workers,
-                              exclude_speakers=val_speakers)
-    dev_ds, dev_dl = make(args.dev_manifest, False, 0,
-                          ref_manifest=read_manifest(args.dev_manifest) + ref_rows)
+    train_ds, train_dl, train_bs = make(args.train_manifest, True, args.num_workers,
+                                        exclude_speakers=val_speakers)
+    dev_ds, dev_dl, _ = make(args.dev_manifest, False, 0,
+                             ref_manifest=read_manifest(args.dev_manifest) + ref_rows)
     print(f"train pairs {len(train_ds)}   val pairs {len(dev_ds)}")
     if args.speaker_holdout:
         full_n = len(read_manifest(args.train_manifest))
@@ -433,6 +565,8 @@ def main():
         try:
             batch = next(it)
         except StopIteration:
+            if train_bs is not None:
+                train_bs.set_epoch(train_bs.epoch + 1)   # new batch order each pass
             it = iter(train_dl)
             batch = next(it)
         batch = to_device(batch, device)

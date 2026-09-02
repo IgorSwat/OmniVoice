@@ -69,7 +69,8 @@ from omnivoice.models.omnivoice import (  # noqa: E402
     OmniVoice, _combine_text, _resolve_model_path, _tokenize_with_nonverbal_tags,
 )
 from train_prefix_blocked import (  # noqa: E402
-    DTYPES, ClonePairDataset, build_masks, lr_at, read_manifest, to_device,
+    DTYPES, ClonePairDataset, LengthGroupedBatchSampler, build_masks,
+    clone_pair_lengths, lr_at, read_manifest, row_stats, to_device,
     weighted_ce,
 )
 
@@ -355,6 +356,12 @@ def main():
     p.add_argument("--ref-cap", type=int, default=150)
     p.add_argument("--max-frames", type=int, default=750)
     p.add_argument("--batch-size", type=int, default=8)
+    p.add_argument("--batch-tokens", type=int, default=0, metavar="N",
+                   help="length-grouped batching with a padded-token budget per "
+                        "batch (0 = fixed --batch-size). Memory scales with "
+                        "batch_size * max_len, so this is what actually bounds it.")
+    p.add_argument("--max-batch-size", type=int, default=128,
+                   help="cap on samples per batch when --batch-tokens is used")
     p.add_argument("--grad-accum", type=int, default=1)
     p.add_argument("--steps", type=int, default=10000)
     p.add_argument("--lr", type=float, default=1e-5)
@@ -413,8 +420,21 @@ def main():
     def make(manifest, shuffle, workers, ref_manifest=None, **kw):
         ds = ClonePairDataset(manifest, args.data_root, ref_manifest=ref_manifest,
                               max_frames=args.max_frames, ref_cap=args.ref_cap, **kw)
+        if args.batch_tokens > 0:
+            lengths = clone_pair_lengths(ds, row_stats(manifest, args.data_root, tok),
+                                         args.ref_cap, args.max_frames)
+            bs = LengthGroupedBatchSampler(lengths, args.batch_tokens,
+                                           max_batch_size=args.max_batch_size,
+                                           shuffle=shuffle, seed=args.seed)
+            sizes = [len(b) for b in bs]
+            print(f"  {os.path.basename(manifest)}: {len(bs)} length-grouped batches, "
+                  f"size {min(sizes)}-{max(sizes)} (mean {sum(sizes)/len(sizes):.1f}), "
+                  f"<= {args.batch_tokens} padded tokens each")
+            return ds, DataLoader(ds, batch_sampler=bs, collate_fn=coll,
+                                  num_workers=workers), bs
         return ds, DataLoader(ds, batch_size=args.batch_size, shuffle=shuffle,
-                              collate_fn=coll, num_workers=workers, drop_last=shuffle)
+                              collate_fn=coll, num_workers=workers,
+                              drop_last=shuffle), None
 
     val_speakers = None
     ref_rows = read_manifest(args.dev_ref_manifest or args.train_manifest)
@@ -422,10 +442,10 @@ def main():
         val_speakers = {r["speaker_id"] for r in read_manifest(args.dev_manifest)}
         ref_rows = [r for r in ref_rows if r["speaker_id"] in val_speakers]
 
-    train_ds, train_dl = make(args.train_manifest, True, args.num_workers,
-                              exclude_speakers=val_speakers)
-    dev_ds, dev_dl = make(args.dev_manifest, False, 0,
-                          ref_manifest=read_manifest(args.dev_manifest) + ref_rows)
+    train_ds, train_dl, train_bs = make(args.train_manifest, True, args.num_workers,
+                                        exclude_speakers=val_speakers)
+    dev_ds, dev_dl, _ = make(args.dev_manifest, False, 0,
+                             ref_manifest=read_manifest(args.dev_manifest) + ref_rows)
     print(f"train pairs {len(train_ds)}   val pairs {len(dev_ds)}"
           f"{'  (validation voices unseen in training)' if args.speaker_holdout else ''}")
     if len(dev_ds) == 0:
@@ -452,6 +472,8 @@ def main():
         try:
             batch = next(it)
         except StopIteration:
+            if train_bs is not None:
+                train_bs.set_epoch(train_bs.epoch + 1)   # new batch order each pass
             it = iter(train_dl)
             batch = next(it)
         batch = to_device(batch, device)
