@@ -47,7 +47,7 @@ from omnivoice.models.omnivoice import (  # noqa: E402
     _resolve_model_path,
     _tokenize_with_nonverbal_tags,
 )
-from width_pruning.manifest import codec_path  # noqa: E402
+from p4_width_pruning.manifest import codec_path  # noqa: E402
 
 DTYPES = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}
 

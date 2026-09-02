@@ -23,6 +23,20 @@ which is what makes A/B comparison meaningful rather than a sampler lottery.
 Pair two runs into a blind listening test with `--blind`:
 
     python scripts/eval/generate_samples.py --blind tmp/teacher tmp/prefix_blocked
+
+`--prefix-blocked` runs generation with prefix-query -> target-key attention cut,
+which is the topology a prefix-blocked checkpoint was trained for. Without it,
+such a checkpoint is evaluated in the one configuration it was trained NOT to be
+used in.
+
+    # the three arms that decide whether stage 2 works
+    python scripts/eval/generate_samples.py --cross                      # teacher, full
+    python scripts/eval/generate_samples.py --cross --prefix-blocked     # teacher, blocked (zero-shot)
+    python scripts/eval/generate_samples.py --cross --prefix-blocked \
+        --model runs/prefix_blocked                                      # student, blocked
+
+NOTE: this changes the attention MASK only. It does not hoist the prefix forward
+out of the step loop, so RTF is unchanged -- this measures quality, not speed.
 """
 
 import argparse
@@ -38,6 +52,48 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from common import DTYPES, TEST_DIR, load_model, model_tag, read_test_inputs  # noqa: E402
+
+
+def enable_prefix_blocking(model):
+    """Cut prefix-query -> target-key attention during generation.
+
+    `_generate_iterative` builds a `[2B, 1, S, S]` mask and reuses it across every
+    diffusion step, so the block can be applied by wrapping `forward` rather than
+    forking the whole sampler.
+
+    The per-item lengths are recoverable from the mask itself. The conditional row
+    `i` is filled as `[:c_len, :c_len] = True`, so query 0 has exactly `c_len` keys;
+    the unconditional row `B + i` is built target-only as `[:u_len, :u_len] = True`
+    with `u_len == target_len`, so its query 0 has exactly `t_len` keys. The prefix
+    is therefore `[0, c_len - t_len)` and the target `[c_len - t_len, c_len)`.
+
+    The unconditional branch carries no prefix at all, so it needs no blocking.
+
+    Applied in place: the sampler hands back the same mask tensor every step and
+    the write is idempotent, so this costs one pass, not one per step.
+    """
+    original = model.forward
+
+    def forward(*args, **kwargs):
+        am = kwargs.get("attention_mask")
+        if am is not None and am.dim() == 4 and am.shape[0] % 2 == 0:
+            B = am.shape[0] // 2
+            for i in range(B):
+                # Must be idempotent: the sampler reuses this tensor every step and
+                # the write below is in place. Reading query row 0 would work only
+                # once -- row 0 is a PREFIX query, so after the first block it
+                # reports `p` rather than `c_len`, and the next call would zero a
+                # shifted region. Target-query rows are never modified, and they
+                # hold the maximum, so the max over queries is stable.
+                c_len = int(am[i, 0].sum(-1).max())
+                t_len = int(am[B + i, 0].sum(-1).max())
+                p = c_len - t_len
+                if 0 < p < c_len:
+                    am[i, :, :p, p:c_len] = False
+        return original(*args, **kwargs)
+
+    model.forward = forward
+    return original
 
 
 def make_blind(dirs, out_dir, seed):
@@ -90,6 +146,14 @@ def main():
     ap.add_argument("--num-step", type=int, default=32)
     ap.add_argument("--t-shift", type=float, default=0.1)
     ap.add_argument("--guidance-scale", type=float, default=2.0)
+    ap.add_argument("--prefix-blocked", action="store_true",
+                    help="cut prefix->target attention (mask only; RTF unchanged). "
+                         "Required to evaluate a prefix-blocked checkpoint in the "
+                         "topology it was trained for.")
+    ap.add_argument("--prefix-cached", action="store_true",
+                    help="prefix blocking AND the K/V hoist: the prefix runs once, "
+                         "each step forwards only the target. Bit-identical output "
+                         "to --prefix-blocked, but actually faster.")
     ap.add_argument("--cross", action="store_true",
                     help="every speaker x every target (81) instead of the diagonal (9)")
     ap.add_argument("--speakers", nargs="*", default=None, help="subset of voices")
@@ -127,7 +191,8 @@ def main():
         # Diagonal: each voice reads the line written for it.
         cells = [(s, s) for s in speakers if s in targets]
 
-    tag = args.tag or model_tag(args.model)
+    suffix = "_cached" if args.prefix_cached else ("_blocked" if args.prefix_blocked else "")
+    tag = args.tag or model_tag(args.model) + suffix
     out = os.path.join(args.out_dir, tag)
     os.makedirs(out, exist_ok=True)
 
@@ -144,11 +209,19 @@ def main():
     print(f"model {args.model}  ->  {out}/")
     print(f"{len(todo)} of {len(cells)} clips to generate "
           f"(num_step={args.num_step}, t_shift={args.t_shift}, "
-          f"guidance_scale={args.guidance_scale})")
+          f"guidance_scale={args.guidance_scale}"
+          f"{', prefix-cached' if args.prefix_cached else (', prefix-blocked' if args.prefix_blocked else '')})")
 
     t0 = time.time()
     model = load_model(args.model, args.device, args.dtype)
     print(f"loaded in {time.time()-t0:.1f}s  llm={model.llm.device}", flush=True)
+    if args.prefix_cached:
+        import prefix_cache
+        prefix_cache.enable(model)
+        print("prefix K/V CACHE enabled (prefix runs once per generation)", flush=True)
+    elif args.prefix_blocked:
+        enable_prefix_blocking(model)
+        print("prefix blocking ENABLED (mask only -- RTF is unchanged)", flush=True)
 
     gen_cfg = OmniVoiceGenerationConfig(num_step=args.num_step, t_shift=args.t_shift,
                                         guidance_scale=args.guidance_scale)
@@ -195,7 +268,9 @@ def main():
     merged = {r["path"]: r for r in prev}
     merged.update({r["path"]: r for r in records})
     with open(manifest, "w", encoding="utf-8") as f:
-        json.dump({"model": args.model, "num_step": args.num_step,
+        json.dump({"model": args.model, "prefix_blocked": args.prefix_blocked,
+                   "prefix_cached": args.prefix_cached,
+                   "num_step": args.num_step,
                    "t_shift": args.t_shift, "guidance_scale": args.guidance_scale,
                    "seed": args.seed, "device": args.device, "dtype": args.dtype,
                    "samples": sorted(merged.values(), key=lambda r: r["path"])}, f,

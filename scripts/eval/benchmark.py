@@ -136,6 +136,8 @@ def main():
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--asr-model", default="mlx-community/whisper-large-v3-turbo")
     ap.add_argument("--no-wer", dest="wer", action="store_false")
+    ap.add_argument("--prefix-cached", action="store_true",
+                    help="prefix K/V hoist (bit-identical output, real speedup)")
     args = ap.parse_args()
 
     import torch
@@ -176,6 +178,12 @@ def main():
         prompts[ref["name"]] = VoiceClonePrompt(
             ref_audio_tokens=toks, ref_text=ref["transcription"],
             ref_rms=float(np.sqrt(np.mean(wav ** 2))))
+
+    if args.prefix_cached:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import prefix_cache
+        prefix_cache.enable(model)
+        print("prefix K/V cache enabled")
 
     split = Split(model, args.device)
     sync = split._sync
