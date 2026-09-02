@@ -208,13 +208,13 @@ def cfg_log_probs(c_logits, u_logits, guidance_scale, mask_id):
     return lp
 
 
-def weighted_kd_logp(s_logits, t_logp, labels, w, temperature=1.0, topk=0):
+def weighted_kd_logp(s_logits, t_logp, labels, w, temperature=1.0):
     """KL(teacher || student), teacher given as log-probabilities.
 
     `t_logp` contains -inf at the suppressed mask id, and `0 * -inf` is NaN, so
     zero-probability entries are dropped explicitly rather than multiplied through.
 
-    With ``topk > 0`` this becomes a **grouped** KL: the teacher's top-k outcomes
+    Pass ``t_logp`` as a ``(t_top, idx)`` pair for a **grouped** KL: the teacher's top-k outcomes
     are kept individually and everything else is lumped into a single "rest"
     bucket. The motivation is that the gradient of a full KL is `p_s - p_t` per
     entry, which is NOT probability-weighted -- measured on this model, ~37% of
@@ -230,11 +230,15 @@ def weighted_kd_logp(s_logits, t_logp, labels, w, temperature=1.0, topk=0):
     the full KL.
     """
     t = temperature
-    lps = torch.log_softmax(s_logits / t, dim=-1)
 
-    if topk and topk < t_logp.shape[-1]:
-        t_top, idx = t_logp.topk(topk, dim=-1)
-        s_top = lps.gather(-1, idx)
+    if isinstance(t_logp, tuple):
+        # Grouped path. Only the softmax NORMALISER is needed over the full vocab,
+        # and logsumexp is a reduction -- so the [B,C,T,V] log_softmax tensor (and
+        # the `s_logits / t` copy feeding it) never gets built, which is where the
+        # memory actually went. Both were full-size and saved for backward.
+        t_top, idx = t_logp
+        z = s_logits if t == 1.0 else s_logits / t
+        s_top = z.gather(-1, idx) - torch.logsumexp(z, dim=-1, keepdim=True)
         pt = t_top.exp()
         term = torch.where(pt > 0, pt * (t_top - s_top), torch.zeros_like(pt))
         kl = term.sum(dim=-1)
@@ -244,6 +248,7 @@ def weighted_kd_logp(s_logits, t_logp, labels, w, temperature=1.0, topk=0):
         s_rest = (1.0 - s_top.exp().sum(dim=-1)).clamp_min(1e-9)
         kl = kl + t_rest * (t_rest.log() - s_rest.log())
     else:
+        lps = torch.log_softmax(s_logits / t, dim=-1)
         pt = t_logp.exp()
         term = torch.where(pt > 0, pt * (t_logp - lps), torch.zeros_like(pt))
         kl = term.sum(dim=-1)                               # [B, C, T]
@@ -253,7 +258,8 @@ def weighted_kd_logp(s_logits, t_logp, labels, w, temperature=1.0, topk=0):
     return (per_cb * w).sum() * t * t
 
 
-def forward_pair(teacher, student, batch, args, mask_id):
+def forward_pair(teacher, student, batch, args, mask_id, topk=0,
+                 want_teacher_cond=False):
     """Teacher CFG-mixed target and the student's conditional logits, aligned."""
     cond_attn = build_masks(batch["valid"], batch["prefix_len"], args.prefix_blocked)
     u_attn = (batch["u_valid"][:, None, None, :]
@@ -266,6 +272,13 @@ def forward_pair(teacher, student, batch, args, mask_id):
         t_u = logits_of(teacher, batch["u_input_ids"], batch["u_audio_mask"],
                         u_attn, batch["u_position_ids"])
         t_logp = cfg_log_probs(t_c, t_u, args.guidance_scale, mask_id)
+        del t_u
+        if topk:
+            # Truncate BEFORE the student runs, so the full-vocab teacher target is
+            # not held alive across the student's forward and backward.
+            t_logp = t_logp.topk(topk, dim=-1)
+        if not want_teacher_cond:
+            t_c = None          # training does not read it; eval does
 
     s = gather_target(
         logits_of(student, batch["input_ids"], batch["audio_mask"],
@@ -293,7 +306,8 @@ def evaluate(student, teacher, loader, device, w, args, mask_id,
             if max_batches and i >= max_batches:
                 break
             batch = to_device(batch, device)
-            s, t_logp, t_c = forward_pair(teacher, student, batch, args, mask_id)
+            s, t_logp, t_c = forward_pair(teacher, student, batch, args,
+                                          mask_id, want_teacher_cond=True)
             # topk is deliberately NOT passed here: the reported number must stay
             # the full 1025-way KL, or it cannot be compared against other runs.
             tot["kl"] += float(weighted_kd_logp(s, t_logp, batch["labels"], w))
@@ -443,9 +457,10 @@ def main():
         batch = to_device(batch, device)
 
         with torch.autocast(device.type, dtype=torch.bfloat16, enabled=amp):
-            s_logits, t_logp, _ = forward_pair(teacher, student, batch, args, mask_id)
+            s_logits, t_logp, _ = forward_pair(teacher, student, batch, args,
+                                               mask_id, topk=args.kd_topk)
             kd = weighted_kd_logp(s_logits, t_logp, batch["labels"], w,
-                                  args.temperature, topk=args.kd_topk)
+                                  args.temperature)
             ce = (weighted_ce(s_logits, batch["labels"], w)
                   if args.ce_weight > 0 else torch.zeros((), device=device))
             loss = args.kd_weight * kd + args.ce_weight * ce

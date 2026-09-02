@@ -232,8 +232,14 @@ def main():
     print(f"loaded in {time.time()-t0:.1f}s  llm={model.llm.device}", flush=True)
     if args.prefix_cached:
         import prefix_cache
-        prefix_cache.enable(model)
-        print("prefix K/V CACHE enabled (prefix runs once per generation)", flush=True)
+        # With guidance_scale=0 the unconditional branch is still computed and
+        # then discarded by the sampler; skipping it is where a guidance-distilled
+        # student's speedup actually lives.
+        skip_u = args.guidance_scale == 0
+        prefix_cache.enable(model, skip_uncond=skip_u)
+        print("prefix K/V CACHE enabled (prefix runs once per generation)"
+              + ("; unconditional branch SKIPPED (guidance_scale=0)" if skip_u else ""),
+              flush=True)
     elif args.prefix_blocked:
         enable_prefix_blocking(model)
         print("prefix blocking ENABLED (mask only -- RTF is unchanged)", flush=True)

@@ -38,7 +38,12 @@ class PrefixCachedGenerator:
     matters. B>1 still works, just without cross-item batching.
     """
 
-    def __init__(self, model):
+    def __init__(self, model, skip_uncond=False):
+        # `_generate_iterative` always builds a 2B batch, and `guidance_scale=0`
+        # merely stops `_predict_tokens_with_scoring` from *reading* the
+        # unconditional half -- the forward still runs. A guidance-distilled
+        # student gets no speedup at all unless that branch is actually skipped.
+        self.skip_uncond = skip_uncond
         self.model = model
         self._orig_forward = model.forward
         self._orig_iter = model._generate_iterative
@@ -141,17 +146,20 @@ class PrefixCachedGenerator:
             logits[i, :, p:c_len, :] = self._heads(hidden)[0]
 
             # ---- unconditional branch: target-only, padding dropped ----
-            pos = torch.arange(t_len, device=dev).unsqueeze(0)
-            mask = torch.ones(1, 1, t_len, t_len, dtype=torch.bool, device=dev)
-            hidden = self._run(embed(B + i, 0, t_len), pos, mask)
-            logits[B + i, :, :t_len, :] = self._heads(hidden)[0]
+            # Left as zeros when skipped: with guidance_scale=0 the sampler slices
+            # `u_logits` but never uses it, so the values are inert.
+            if not self.skip_uncond:
+                pos = torch.arange(t_len, device=dev).unsqueeze(0)
+                mask = torch.ones(1, 1, t_len, t_len, dtype=torch.bool, device=dev)
+                hidden = self._run(embed(B + i, 0, t_len), pos, mask)
+                logits[B + i, :, :t_len, :] = self._heads(hidden)[0]
 
         from omnivoice.models.omnivoice import OmniVoiceModelOutput
         return OmniVoiceModelOutput(loss=None, logits=logits)
 
 
-def enable(model):
-    return PrefixCachedGenerator(model)
+def enable(model, skip_uncond=False):
+    return PrefixCachedGenerator(model, skip_uncond=skip_uncond)
 
 
 def verify(model, prompt, text, language="en", num_step=4, atol=2e-2):
