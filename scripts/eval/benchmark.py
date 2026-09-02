@@ -40,9 +40,16 @@ FRAME_RATE = 25.0
 
 
 def parse_config(spec):
-    steps, t_shift = spec.split(":")
-    return f"s{int(steps)}_t{float(t_shift)}", {"num_step": int(steps),
-                                                "t_shift": float(t_shift)}
+    """``"16:0.1"`` or ``"16:0.1:0.0"`` (the third field is guidance_scale)."""
+    parts = spec.split(":")
+    if len(parts) not in (2, 3):
+        raise SystemExit(f"bad --config {spec!r}: want STEPS:T_SHIFT[:GUIDANCE]")
+    cfg = {"num_step": int(parts[0]), "t_shift": float(parts[1])}
+    tag = f"s{cfg['num_step']}_t{cfg['t_shift']}"
+    if len(parts) == 3:
+        cfg["guidance_scale"] = float(parts[2])
+        tag += f"_g{cfg['guidance_scale']}"
+    return tag, cfg
 
 
 def build_pairs(args, estimator):
@@ -182,7 +189,12 @@ def main():
     if args.prefix_cached:
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         import prefix_cache
-        prefix_cache.enable(model)
+        # guidance_scale=0 makes the unconditional branch dead weight; skipping
+        # it is where a guidance-distilled student's speedup actually is.
+        skip_u = all(c.get("guidance_scale", 2.0) == 0 for _, c in configs)
+        prefix_cache.enable(model, skip_uncond=skip_u)
+        if skip_u:
+            print("  unconditional branch SKIPPED (guidance_scale=0)")
         print("prefix K/V cache enabled")
 
     split = Split(model, args.device)

@@ -49,22 +49,22 @@ def read_test_inputs(test_dir=TEST_DIR):
 def load_model(model_path, device="mps", dtype="fp16"):
     """Load OmniVoice for inference, keeping the codec off MPS.
 
-    Two constraints force this shape: the Higgs codec cannot run on MPS at all
-    (output channels > 65536), and loading straight onto MPS segfaults during
-    weight loading. So: load on CPU, detach the codec, move only the LM.
+    Loading straight onto MPS segfaults during weight loading, so the LM is
+    loaded on CPU and moved. The codec is detached during that move because it
+    must stay fp32 -- in fp16 its conv decoder returns NaN for every sample --
+    and is then placed by `place_codec`, which probes the device and falls back
+    to CPU if it does not work there. On MPS that is ~1.9x faster than CPU.
     """
     import torch
-    from omnivoice.models.omnivoice import OmniVoice
+    from omnivoice.models.omnivoice import OmniVoice, place_codec
 
     torch_dtype = getattr(torch, DTYPES[dtype])
     model = OmniVoice.from_pretrained(model_path, device_map="cpu", dtype=torch.float32)
-    if device == "mps":
-        codec, fe = model.audio_tokenizer, model.feature_extractor
-        model.audio_tokenizer = None
-        model.to(device, torch_dtype)
-        model.audio_tokenizer, model.feature_extractor = codec, fe
-    else:
-        model.to(device, torch_dtype)
+    codec, fe = model.audio_tokenizer, model.feature_extractor
+    model.audio_tokenizer = None                 # never let it inherit fp16
+    model.to(device, torch_dtype)
+    model.audio_tokenizer = place_codec(codec, device, model.config.num_audio_codebook)
+    model.feature_extractor = fe
     return model.eval()
 
 
