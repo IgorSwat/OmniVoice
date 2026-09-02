@@ -97,32 +97,46 @@ def enable_prefix_blocking(model):
 
 
 def make_blind(dirs, out_dir, seed):
-    """Copy two result directories into randomised A/B pairs for blind listening."""
-    a_dir, b_dir = dirs
-    names = sorted(set(os.listdir(a_dir)) & set(os.listdir(b_dir)))
-    names = [n for n in names if n.endswith(".wav")]
+    """Copy N result directories into randomised A/B/C... sets for blind listening.
+
+    Letters are shuffled independently per row, so no arm sits under one letter
+    across the sheet. With more than two arms the sheet asks for a ranking rather
+    than a preference.
+    """
+    if len(dirs) < 2:
+        raise SystemExit("--blind needs at least two directories")
+    sets = [{n for n in os.listdir(d) if n.endswith(".wav")} for d in dirs]
+    names = sorted(set.intersection(*sets))
     if not names:
-        raise SystemExit(f"no common .wav files between {a_dir} and {b_dir}")
+        raise SystemExit(f"no .wav files common to all of {dirs}")
 
     os.makedirs(out_dir, exist_ok=True)
+    letters = [chr(ord("A") + i) for i in range(len(dirs))]
     rng = random.Random(seed)
     key = {}
     for n in names:
         stem = n[:-4]
-        letters = ["A", "B"]
-        rng.shuffle(letters)
-        for letter, src_dir in zip(letters, [a_dir, b_dir]):
+        shuffled = letters[:]
+        rng.shuffle(shuffled)
+        for letter, src in zip(shuffled, dirs):
             dst = f"{stem}_{letter}.wav"
-            shutil.copy(os.path.join(src_dir, n), os.path.join(out_dir, dst))
-            key[dst] = src_dir
+            shutil.copy(os.path.join(src, n), os.path.join(out_dir, dst))
+            key[dst] = src
 
     sheet = os.path.join(out_dir, "listening_sheet.md")
     with open(sheet, "w", encoding="utf-8") as f:
-        f.write("# Blind A/B\n\nSame reference, same text, same seed within each "
-                "pair. A/B randomised per row.\n\n"
-                "- **prefer** — A, B, or `=` if you cannot tell\n"
-                "- **conf** — 1 (guessing) / 2 (leaning) / 3 (obvious)\n\n"
-                "| pair | prefer | conf | what differed |\n|---|---|---|---|\n")
+        f.write(f"# Blind test — {len(dirs)} arms\n\n"
+                "Same reference, same text, same seed within each row. The letters are "
+                "shuffled independently per row, so a letter means nothing across rows.\n\n")
+        if len(dirs) == 2:
+            f.write("- **prefer** — A, B, or `=` if you cannot tell\n"
+                    "- **conf** — 1 (guessing) / 2 (leaning) / 3 (obvious)\n\n"
+                    "| pair | prefer | conf | what differed |\n|---|---|---|---|\n")
+        else:
+            f.write(f"- **rank** — best to worst, e.g. `{'>'.join(letters)}`. "
+                    f"Use `=` for ties, e.g. `{letters[0]}={letters[1]}>{letters[2]}`\n"
+                    "- **conf** — 1 (guessing) / 2 (leaning) / 3 (obvious)\n\n"
+                    "| row | rank | conf | what differed |\n|---|---|---|---|\n")
         for n in names:
             f.write(f"| {n[:-4]:<12s} |  |  |  |\n")
 
@@ -130,8 +144,8 @@ def make_blind(dirs, out_dir, seed):
     key_path = os.path.join(os.path.dirname(out_dir.rstrip("/")) or ".",
                             f".{os.path.basename(out_dir.rstrip('/'))}_key.json")
     with open(key_path, "w", encoding="utf-8") as f:
-        json.dump({"seed": seed, "key": key}, f, indent=2)
-    print(f"{len(names)} pairs -> {out_dir}\nsheet: {sheet}\nkey:   {key_path}")
+        json.dump({"seed": seed, "arms": dirs, "key": key}, f, indent=2)
+    print(f"{len(names)} rows x {len(dirs)} arms -> {out_dir}\nsheet: {sheet}\nkey:   {key_path}")
 
 
 def main():
@@ -163,8 +177,9 @@ def main():
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--overwrite", action="store_true",
                     help="regenerate files that already exist")
-    ap.add_argument("--blind", nargs=2, metavar=("DIR_A", "DIR_B"), default=None,
-                    help="skip generation; pair two existing result dirs blind")
+    ap.add_argument("--blind", nargs="+", metavar="DIR", default=None,
+                    help="skip generation; shuffle N existing result dirs into a "
+                         "blind A/B/C... set")
     args = ap.parse_args()
 
     if args.blind:

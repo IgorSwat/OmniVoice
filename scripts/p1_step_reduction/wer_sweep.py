@@ -94,10 +94,21 @@ def read_inputs(test_dir):
 
 
 def parse_config(spec):
-    """``"16:0.2"`` -> ``("s16_t0.2", {"num_step": 16, "t_shift": 0.2})``."""
-    steps, t_shift = spec.split(":")
-    steps, t_shift = int(steps), float(t_shift)
-    return f"s{steps}_t{t_shift}", {"num_step": steps, "t_shift": t_shift}
+    """``"16:0.2"`` -> ``("s16_t0.2", {...})``; ``"16:0.1:1.5"`` adds guidance scale.
+
+    The tag only carries the fields that were given, so existing sweeps keep
+    their directory names and stay resumable.
+    """
+    parts = spec.split(":")
+    if len(parts) not in (2, 3):
+        raise SystemExit(f"bad --config {spec!r}: want STEPS:T_SHIFT[:GUIDANCE]")
+    steps, t_shift = int(parts[0]), float(parts[1])
+    cfg = {"num_step": steps, "t_shift": t_shift}
+    tag = f"s{steps}_t{t_shift}"
+    if len(parts) == 3:
+        cfg["guidance_scale"] = float(parts[2])
+        tag += f"_g{cfg['guidance_scale']}"
+    return tag, cfg
 
 
 # Whisper's EnglishTextNormalizer expands contractions only on ASCII apostrophes.
@@ -146,6 +157,8 @@ def stage_generate(args, refs, targets, configs):
     for tag, _ in configs:
         for si, sp in enumerate(speakers):
             for ti, tg in enumerate(target_names):
+                if args.diagonal and sp != tg:
+                    continue
                 for rep in range(args.seeds):
                     path = cell_path(args.out_dir, tag, sp, tg, rep)
                     if not (args.resume and os.path.exists(path)):
@@ -155,9 +168,10 @@ def stage_generate(args, refs, targets, configs):
         print("generate: nothing to do (all outputs present)")
         return
 
+    n_cells = len(speakers) if args.diagonal else len(speakers) * len(target_names)
     print(f"generate: {len(todo)} utterances "
-          f"({len(configs)} configs x {len(speakers)} speakers x "
-          f"{len(target_names)} targets x {args.seeds} seeds)")
+          f"({len(configs)} configs x {n_cells} cells x {args.seeds} seeds"
+          f"{', diagonal' if args.diagonal else ''})")
 
     print("loading model ...", flush=True)
     t0 = time.time()
@@ -313,7 +327,8 @@ def stage_report(args):
             "rtf": r.get("rtf"), "hyp": hyps[r["path"]], "ref": r["text"],
         })
 
-    configs = sorted({c["config"] for c in cells}, key=lambda t: (-int(t[1:].split("_")[0]), t))
+    configs = sorted({c["config"] for c in cells},
+                     key=lambda t: (-int(t[1:].split("_")[0]), t))
     report = {"n_cells": len(cells), "configs": {}}
 
     def agg(subset):
@@ -423,7 +438,7 @@ def main():
     ap.add_argument("--test-dir", default="data/test")
     ap.add_argument("--out-dir", default="runs/step_reduction")
     ap.add_argument("--model", default="k2-fsa/OmniVoice")
-    ap.add_argument("--config", action="append", metavar="STEPS:T_SHIFT",
+    ap.add_argument("--config", action="append", metavar="STEPS:T_SHIFT[:GUIDANCE]",
                     help="repeatable; first one is the paired baseline "
                          "(default: 32:0.1 and 16:0.2)")
     ap.add_argument("--stage", default="all",
@@ -432,6 +447,9 @@ def main():
     ap.add_argument("--dtype", default="fp16", choices=list(DTYPES))
     ap.add_argument("--asr-model", default="mlx-community/whisper-large-v3-turbo")
     ap.add_argument("--seed", type=int, default=1234)
+    ap.add_argument("--diagonal", action="store_true",
+                    help="only speaker==target cells (9) instead of the full "
+                         "cross product (81)")
     ap.add_argument("--seeds", type=int, default=1,
                     help="repeats per cell; repeat 0 reuses existing files")
     ap.add_argument("--bootstrap", type=int, default=10000)

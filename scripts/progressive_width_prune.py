@@ -47,8 +47,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from transformers import AutoTokenizer  # noqa: E402
 
 from omnivoice.models.omnivoice import OmniVoice, _resolve_model_path  # noqa: E402
-from width_pruning import calibration, distill, repair, surgery  # noqa: E402
-from width_pruning.manifest import (  # noqa: E402
+from p4_width_pruning import calibration, distill, repair, surgery  # noqa: E402
+from p4_width_pruning.manifest import (  # noqa: E402
     CodecManifestDataset,
     build_dataloader,
     build_processor,

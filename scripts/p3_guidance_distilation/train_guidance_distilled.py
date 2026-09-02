@@ -208,17 +208,46 @@ def cfg_log_probs(c_logits, u_logits, guidance_scale, mask_id):
     return lp
 
 
-def weighted_kd_logp(s_logits, t_logp, labels, w, temperature=1.0):
-    """KL(teacher || student) where the teacher is given as log-probabilities.
+def weighted_kd_logp(s_logits, t_logp, labels, w, temperature=1.0, topk=0):
+    """KL(teacher || student), teacher given as log-probabilities.
 
-    `t_logp` contains -inf at the suppressed mask id, and `0 * -inf` is NaN, so the
+    `t_logp` contains -inf at the suppressed mask id, and `0 * -inf` is NaN, so
     zero-probability entries are dropped explicitly rather than multiplied through.
+
+    With ``topk > 0`` this becomes a **grouped** KL: the teacher's top-k outcomes
+    are kept individually and everything else is lumped into a single "rest"
+    bucket. The motivation is that the gradient of a full KL is `p_s - p_t` per
+    entry, which is NOT probability-weighted -- measured on this model, ~37% of
+    the gradient magnitude lands outside the teacher's top-64, on entries the
+    sampler never reads (it consumes only `argmax` and `max log p`).
+
+    The rest bucket is what makes the coarsening sound rather than merely cheaper.
+    Without it the student could pile mass onto a token outside the teacher's
+    top-k for free -- and that token could become its argmax, which is precisely
+    what the sampler does read. Lumping penalises any mass leaving the head while
+    leaving the tail's internal arrangement unconstrained. Formally this is a KL
+    on a coarsened partition, so by the data-processing inequality it lower-bounds
+    the full KL.
     """
     t = temperature
     lps = torch.log_softmax(s_logits / t, dim=-1)
-    pt = t_logp.exp()
-    term = torch.where(pt > 0, pt * (t_logp - lps), torch.zeros_like(pt))
-    kl = term.sum(dim=-1)                                   # [B, C, T]
+
+    if topk and topk < t_logp.shape[-1]:
+        t_top, idx = t_logp.topk(topk, dim=-1)
+        s_top = lps.gather(-1, idx)
+        pt = t_top.exp()
+        term = torch.where(pt > 0, pt * (t_top - s_top), torch.zeros_like(pt))
+        kl = term.sum(dim=-1)
+        # The lumped remainder. Clamped because both sums approach 1 and the
+        # complement is a small difference of large numbers in fp32.
+        t_rest = (1.0 - pt.sum(dim=-1)).clamp_min(1e-9)
+        s_rest = (1.0 - s_top.exp().sum(dim=-1)).clamp_min(1e-9)
+        kl = kl + t_rest * (t_rest.log() - s_rest.log())
+    else:
+        pt = t_logp.exp()
+        term = torch.where(pt > 0, pt * (t_logp - lps), torch.zeros_like(pt))
+        kl = term.sum(dim=-1)                               # [B, C, T]
+
     mask = (labels != -100).float()
     per_cb = (kl * mask).sum(dim=(0, 2)) / mask.sum(dim=(0, 2)).clamp(min=1.0)
     return (per_cb * w).sum() * t * t
@@ -265,6 +294,8 @@ def evaluate(student, teacher, loader, device, w, args, mask_id,
                 break
             batch = to_device(batch, device)
             s, t_logp, t_c = forward_pair(teacher, student, batch, args, mask_id)
+            # topk is deliberately NOT passed here: the reported number must stay
+            # the full 1025-way KL, or it cannot be compared against other runs.
             tot["kl"] += float(weighted_kd_logp(s, t_logp, batch["labels"], w))
             tot["kl_uncond"] += float(
                 weighted_kd_logp(t_c, t_logp, batch["labels"], w))
@@ -316,6 +347,10 @@ def main():
     p.add_argument("--weight-decay", type=float, default=0.01)
     p.add_argument("--max-grad-norm", type=float, default=1.0)
     p.add_argument("--temperature", type=float, default=1.0)
+    p.add_argument("--kd-topk", type=int, default=0, metavar="K",
+                   help="grouped KL over the teacher's top-K plus one lumped "
+                        "'rest' bucket (0 = full 1025-way KL). Validation always "
+                        "reports the FULL KL so runs stay comparable.")
     p.add_argument("--kd-weight", type=float, default=1.0)
     p.add_argument("--ce-weight", type=float, default=0.0,
                    help="ground-truth CE added to the KD term. CE is far larger "
@@ -409,7 +444,8 @@ def main():
 
         with torch.autocast(device.type, dtype=torch.bfloat16, enabled=amp):
             s_logits, t_logp, _ = forward_pair(teacher, student, batch, args, mask_id)
-            kd = weighted_kd_logp(s_logits, t_logp, batch["labels"], w, args.temperature)
+            kd = weighted_kd_logp(s_logits, t_logp, batch["labels"], w,
+                                  args.temperature, topk=args.kd_topk)
             ce = (weighted_ce(s_logits, batch["labels"], w)
                   if args.ce_weight > 0 else torch.zeros((), device=device))
             loss = args.kd_weight * kd + args.ce_weight * ce
