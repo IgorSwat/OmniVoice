@@ -82,11 +82,17 @@ class PromptSplitDataset(Dataset):
     exceeds ``--max-prompt-ratio`` of the utterance. The floor binds only on short
     utterances: at a 0.3 cap it takes effect below T = 50/0.7 ~= 71 frames (2.9 s).
 
-    Injecting ``clean_start_token_idx`` is the processor's own hook for an explicit
-    split (`processor.py:133`). It also prepends ``<|denoise|>`` to the style
-    prefix (`processor.py:102`) -- which is what inference does whenever a
-    reference is supplied, so this moves training *towards* the inference topology
-    rather than away from it.
+    The frame count is attached as ``_prompt_frames`` and applied by the collate
+    function, which pins ``prompt_ratio_range`` for that one sample.
+
+    It is NOT passed as ``clean_start_token_idx``. That field looks like a
+    prompt-boundary hook but is the *denoising* flag: it additionally prepends
+    ``<|denoise|>`` to the style prefix and forces ``drop_cond = False``
+    (`processor.py:71`). Using it silently disabled the unconditional path for
+    every sample. Measured after ~24k steps of that, the unconditional branch had
+    drifted to KL 0.672 from the teacher while the conditional branch was fine at
+    0.262 -- and since CFG mixes as ``(1+w)*log p_c - w*log p_u``, an error there
+    is amplified rather than diluted.
     """
 
     def __init__(self, base, min_target_frames, max_prompt_ratio):
@@ -101,8 +107,7 @@ class PromptSplitDataset(Dataset):
         s = self.base[i]
         T = s["audio_tokens"].shape[1]
         cap = max(0, T - self.min_target_frames)
-        s["label"] = dict(s["label"])
-        s["label"]["clean_start_token_idx"] = min(
+        s["_prompt_frames"] = min(
             int(T * random.uniform(0.0, self.max_prompt_ratio)), cap)
         return s
 
@@ -157,12 +162,28 @@ def build_loader(ds, processor, batch_tokens, max_batch_size, shuffle, seed,
 
     def collate(samples):
         processed, prompts = [], []
-        for s in samples:
-            processed.append(processor(s))
-            prompts.append(s["label"].get("clean_start_token_idx", 0))
+        saved = processor.prompt_ratio_range
+        try:
+            for s in samples:
+                T = s["audio_tokens"].shape[1]
+                p = int(s.get("_prompt_frames", 0))
+                # prompt_length = int(T * prompt_ratio), so pinning the range to
+                # (p + 0.5) / T lands on exactly p frames. The +0.5 keeps float
+                # error from truncating to p - 1.
+                processor.prompt_ratio_range = ((p + 0.5) / T,) * 2
+                processed.append(processor(s))
+                prompts.append(p)
+        finally:
+            processor.prompt_ratio_range = saved
         batch = collator(processed)
+        # drop_cond samples (drop_cond_ratio of them) are target-only: no style,
+        # no text, prompt_length forced to 0, so audio_mask[0] is True. They have
+        # no prefix, and must not be assigned one.
+        is_drop = batch["audio_mask"][:, 0]
         audio_start = batch["audio_mask"].float().argmax(dim=1)
-        prefix_len = audio_start + torch.tensor(prompts, dtype=torch.long)
+        prefix_len = torch.where(
+            is_drop, torch.zeros_like(audio_start),
+            audio_start + torch.tensor(prompts, dtype=torch.long))
         batch["prefix_len"] = prefix_len
         if prefix_blocked:
             block_prefix_(batch["attention_mask"], prefix_len)
@@ -500,9 +521,10 @@ def main(argv=None):
     L0 = len(student.llm.layers)
     print(f"device={device}  layers={L0}  params={surgery.count_parameters(student)/1e6:.1f}M")
     print(f"train {len(train_ds)} utts ({train_ds.hours:.1f} h), "
-          f"{per_epoch} steps/epoch -> {steps} per round ({args.epochs:g} ep)"
+          f"{per_epoch} steps/epoch -> {steps} per round "
+          f"({steps/per_epoch:.2g} ep)"
           + (f", {final_steps} for the final round "
-             f"({final_steps/per_epoch:g} ep)" if final_steps != steps else ""))
+             f"({final_steps/per_epoch:.2g} ep)" if final_steps != steps else ""))
     print(f"prompt split: <= {args.max_prompt_ratio:g} of the utterance, "
           f"target floor {args.min_target_seconds:g}s ({min_tgt} frames)")
     print(f"attention: {'PREFIX-BLOCKED (matches stage-2 deployment)' if args.prefix_blocked else 'full bidirectional'}")
