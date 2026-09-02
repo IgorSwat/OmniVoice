@@ -209,7 +209,11 @@ def cfg_log_probs(c_logits, u_logits, guidance_scale, mask_id):
     return lp
 
 
-def weighted_kd_logp(s_logits, t_logp, labels, w, temperature=1.0):
+LOG_FLOOR = -20.7   # log(1e-9)
+
+
+def weighted_kd_logp(s_logits, t_logp, labels, w, temperature=1.0,
+                     reverse=False):
     """KL(teacher || student), teacher given as log-probabilities.
 
     `t_logp` contains -inf at the suppressed mask id, and `0 * -inf` is NaN, so
@@ -241,18 +245,31 @@ def weighted_kd_logp(s_logits, t_logp, labels, w, temperature=1.0):
         z = s_logits if t == 1.0 else s_logits / t
         s_top = z.gather(-1, idx) - torch.logsumexp(z, dim=-1, keepdim=True)
         pt = t_top.exp()
-        term = torch.where(pt > 0, pt * (t_top - s_top), torch.zeros_like(pt))
-        kl = term.sum(dim=-1)
+        ps = s_top.exp()
         # The lumped remainder. Clamped because both sums approach 1 and the
         # complement is a small difference of large numbers in fp32.
         t_rest = (1.0 - pt.sum(dim=-1)).clamp_min(1e-9)
-        s_rest = (1.0 - s_top.exp().sum(dim=-1)).clamp_min(1e-9)
-        kl = kl + t_rest * (t_rest.log() - s_rest.log())
+        s_rest = (1.0 - ps.sum(dim=-1)).clamp_min(1e-9)
+        if reverse:
+            # Still grouped by the TEACHER's top-k. That is the right partition
+            # even here: the student mass reverse KL most wants to punish is
+            # exactly the mass sitting outside the teacher's head, and the rest
+            # bucket charges for it in aggregate.
+            kl = (ps * (s_top - t_top.clamp_min(LOG_FLOOR))).sum(dim=-1)
+            kl = kl + s_rest * (s_rest.log() - t_rest.log())
+        else:
+            term = torch.where(pt > 0, pt * (t_top - s_top), torch.zeros_like(pt))
+            kl = term.sum(dim=-1)
+            kl = kl + t_rest * (t_rest.log() - s_rest.log())
     else:
         lps = torch.log_softmax(s_logits / t, dim=-1)
-        pt = t_logp.exp()
-        term = torch.where(pt > 0, pt * (t_logp - lps), torch.zeros_like(pt))
-        kl = term.sum(dim=-1)                               # [B, C, T]
+        if reverse:
+            ps = lps.exp()
+            kl = (ps * (lps - t_logp.clamp_min(LOG_FLOOR))).sum(dim=-1)
+        else:
+            pt = t_logp.exp()
+            term = torch.where(pt > 0, pt * (t_logp - lps), torch.zeros_like(pt))
+            kl = term.sum(dim=-1)                           # [B, C, T]
 
     mask = (labels != -100).float()
     per_cb = (kl * mask).sum(dim=(0, 2)) / mask.sum(dim=(0, 2)).clamp(min=1.0)
@@ -373,6 +390,11 @@ def main():
                         "'rest' bucket (0 = full 1025-way KL). Validation always "
                         "reports the FULL KL so runs stay comparable.")
     p.add_argument("--kd-weight", type=float, default=1.0)
+    p.add_argument("--kd-reverse", action="store_true",
+                   help="minimise KL(student || teacher) instead of "
+                        "KL(teacher || student): mode-seeking rather than "
+                        "mode-covering. Validation still reports FORWARD KL so "
+                        "runs stay comparable.")
     p.add_argument("--ce-weight", type=float, default=0.0,
                    help="ground-truth CE added to the KD term. CE is far larger "
                         "than KD here, so useful values are small -- run "
@@ -482,7 +504,7 @@ def main():
             s_logits, t_logp, _ = forward_pair(teacher, student, batch, args,
                                                mask_id, topk=args.kd_topk)
             kd = weighted_kd_logp(s_logits, t_logp, batch["labels"], w,
-                                  args.temperature)
+                                  args.temperature, reverse=args.kd_reverse)
             ce = (weighted_ce(s_logits, batch["labels"], w)
                   if args.ce_weight > 0 else torch.zeros((), device=device))
             loss = args.kd_weight * kd + args.ce_weight * ce

@@ -138,6 +138,12 @@ def parse_args(argv=None):
     g.add_argument("--max-batch-size", type=int, default=64)
     g.add_argument("--grad-accum", type=int, default=1)
     g.add_argument("--kd-weight", type=float, default=1.0)
+    g.add_argument("--kd-reverse", action="store_true",
+                   help="minimise KL(student || teacher) instead of "
+                        "KL(teacher || student): mode-seeking rather than "
+                        "mode-covering, which is usually the better "
+                        "compromise once capacity is the binding "
+                        "constraint. Reported metrics stay FORWARD KL.")
     g.add_argument("--ce-weight", type=float, default=0.0)
     g.add_argument(
         "--hidden-weight",
@@ -407,7 +413,7 @@ def main(argv=None):
                 steps=args.steps,
                 lr=args.lr,
                 grad_accum=args.grad_accum,
-                kd_weight=args.kd_weight,
+                kd_weight=args.kd_weight, kd_reverse=args.kd_reverse,
                 ce_weight=args.ce_weight,
                 hidden_weight=args.hidden_weight,
                 temperature=args.temperature,

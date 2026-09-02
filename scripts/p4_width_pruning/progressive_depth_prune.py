@@ -139,7 +139,7 @@ def block_prefix_(attention_mask, prefix_len):
 
 
 def build_loader(ds, processor, batch_tokens, max_batch_size, shuffle, seed,
-                 num_workers, prefix_blocked):
+                 num_workers, prefix_blocked, cfg_teacher=False):
     """`build_dataloader`, plus the prefix block and the boundary it needs.
 
     The boundary is `audio_start + prompt_length`: `audio_start` is the first True
@@ -161,11 +161,38 @@ def build_loader(ds, processor, batch_tokens, max_batch_size, shuffle, seed,
             processed.append(processor(s))
             prompts.append(s["label"].get("clean_start_token_idx", 0))
         batch = collator(processed)
+        audio_start = batch["audio_mask"].float().argmax(dim=1)
+        prefix_len = audio_start + torch.tensor(prompts, dtype=torch.long)
+        batch["prefix_len"] = prefix_len
         if prefix_blocked:
-            audio_start = batch["audio_mask"].float().argmax(dim=1)
-            prefix_len = audio_start + torch.tensor(prompts, dtype=torch.long)
             block_prefix_(batch["attention_mask"], prefix_len)
-            batch["prefix_len"] = prefix_len
+        if cfg_teacher:
+            # The unconditional branch is the target region ALONE -- no style, no
+            # text, no prompt audio -- which is how inference builds it
+            # (omnivoice.py:1342) and what `drop_cond` produces in training.
+            valid = batch["attention_mask"][:, 0].any(dim=1)      # [B, S]
+            lens = valid.sum(dim=1)
+            tlen = (lens - prefix_len).clamp(min=0)
+            B, C, S = batch["input_ids"].shape
+            Tm = int(tlen.max())
+            u_ids = torch.full((B, C, Tm), processor.audio_mask_id, dtype=torch.long)
+            u_valid = torch.zeros(B, Tm, dtype=torch.bool)
+            tgt_index = torch.zeros(B, Tm, dtype=torch.long)
+            for b in range(B):
+                p, t = int(prefix_len[b]), int(tlen[b])
+                if t <= 0:
+                    continue
+                u_ids[b, :, :t] = batch["input_ids"][b, :, p:p + t]
+                u_valid[b, :t] = True
+                tgt_index[b, :t] = torch.arange(p, p + t)
+            batch.update({
+                "u_input_ids": u_ids,
+                "u_audio_mask": u_valid.clone(),   # every uncond position is audio
+                "u_attention_mask": u_valid[:, None, None, :]
+                    .expand(B, 1, Tm, Tm).contiguous(),
+                "u_position_ids": torch.arange(Tm).unsqueeze(0).expand(B, Tm).contiguous(),
+                "tgt_index": tgt_index, "tgt_valid": u_valid,
+            })
         return batch
 
     sampler = LengthGroupedBatchSampler(
@@ -176,6 +203,53 @@ def build_loader(ds, processor, batch_tokens, max_batch_size, shuffle, seed,
                         worker_init_fn=_seed_worker if num_workers else None)
     loader.batch_sampler_ref = sampler
     return loader
+
+
+def make_cfg_teacher(guidance_scale, mask_id):
+    """Teacher logits replaced by its CFG-mixed distribution at target positions.
+
+    Lets the student be a guidance-distilled model (single conditional pass) while
+    the KD target is an ORIGINAL, un-distilled teacher running guidance the
+    expensive way. Without this the only self-consistent option is to distil the
+    p3 model against itself, so each pruning round would only have to match an
+    already-degraded model and the loss would never see the real quality bar.
+
+    Only target positions are rewritten. Everywhere else the conditional logits
+    are left alone, which is harmless because `labels` is -100 outside the masked
+    target region and those positions contribute nothing to the loss.
+
+    The mixed values are log-probabilities, not logits. `log_softmax` is idempotent
+    on a normalised log-prob vector, so the downstream KD sees the right
+    distribution -- but only at ``temperature=1``; a temperature would rescale
+    something that is already normalised.
+    """
+    def fn(teacher, batch):
+        _, tl = _hidden_states(teacher, batch, output_hidden_states=False)
+        c = _audio_logits(teacher, tl).float()                    # [B, C, S, V]
+        _, ul = _hidden_states(teacher, {
+            "input_ids": batch["u_input_ids"],
+            "audio_mask": batch["u_audio_mask"],
+            "attention_mask": batch["u_attention_mask"],
+            "position_ids": batch["u_position_ids"],
+        }, output_hidden_states=False)
+        u = _audio_logits(teacher, ul).float()                    # [B, C, Tm, V]
+
+        B, C, Tm = batch["tgt_index"].shape[0], c.shape[1], batch["tgt_index"].shape[1]
+        idx = batch["tgt_index"][:, None, :, None].expand(B, C, Tm, c.shape[-1])
+        c_tgt = c.gather(2, idx)
+
+        lc = torch.log_softmax(c_tgt, dim=-1)
+        if guidance_scale == 0:
+            lp = lc
+        else:
+            lu = torch.log_softmax(u, dim=-1)
+            lp = torch.log_softmax(lc + guidance_scale * (lc - lu), dim=-1)
+        lp = lp.clone()
+        lp[..., mask_id] = -float("inf")
+        # Padded target slots write back what was already there.
+        lp = torch.where(batch["tgt_valid"][:, None, :, None], lp, c_tgt)
+        return c.scatter(2, idx, lp)
+    return fn
 
 
 # ---------------------------------------------------------------------------
@@ -221,7 +295,8 @@ def remove_layer(model, idx):
 
 
 @torch.no_grad()
-def evaluate_kd(student, teacher, loader, device, w, max_batches=0, seed=1234):
+def evaluate_kd(student, teacher, loader, device, w, max_batches=0, seed=1234,
+                teacher_logits_fn=None):
     """Codebook-weighted KL(teacher || student) on held-out data.
 
     The RNG is pinned and restored for the same reason ``distill.evaluate_loss``
@@ -244,9 +319,10 @@ def evaluate_kd(student, teacher, loader, device, w, max_batches=0, seed=1234):
             batch = {k: v.to(device) for k, v in batch.items()}
             _, tl = _hidden_states(teacher, batch, output_hidden_states=False)
             _, sl = _hidden_states(student, batch, output_hidden_states=False)
+            t_logits = (teacher_logits_fn(teacher, batch) if teacher_logits_fn
+                        else _audio_logits(teacher, tl).float())
             total += float(distill._weighted_kd(
-                _audio_logits(student, sl), _audio_logits(teacher, tl).float(),
-                batch["labels"], w))
+                _audio_logits(student, sl), t_logits, batch["labels"], w))
             n += 1
     finally:
         random.setstate(py)
@@ -256,14 +332,18 @@ def evaluate_kd(student, teacher, loader, device, w, max_batches=0, seed=1234):
     return total / max(n, 1)
 
 
-def score_layers(student, teacher, loader, device, w, max_batches, protect):
-    """KD damage from bypassing each remaining layer, cheapest first."""
+def score_layers(student, score, protect):
+    """Damage from bypassing each remaining layer, cheapest first.
+
+    ``score`` is a zero-argument callable evaluating the CURRENT student -- KD
+    against the teacher, or ground-truth CE when there is no KD term to select on.
+    """
     out = []
     for i in range(len(student.llm.layers)):
         if i in protect:
             continue
         undo = bypass(student, i)
-        out.append((i, evaluate_kd(student, teacher, loader, device, w, max_batches)))
+        out.append((i, score()))
         undo()
     out.sort(key=lambda x: x[1])
     return out
@@ -280,6 +360,12 @@ def main(argv=None):
     g.add_argument("--teacher", default=None,
                    help="KD target, fixed for the whole ladder (default: --model "
                         "as loaded before any cut)")
+    g.add_argument("--teacher-guidance-scale", type=float, default=0.0,
+                   help="run the TEACHER with classifier-free guidance at this "
+                        "scale (0 = plain single pass). Use it to prune a "
+                        "guidance-distilled student against an original teacher: "
+                        "the teacher pays for two branches, the student stays a "
+                        "single pass. Requires --temperature 1.")
     g.add_argument("--train-manifest", default="data/dataset_without_dev.csv")
     g.add_argument("--dev-manifest", default="data/dev_set.csv")
     g.add_argument("--data-root", default="data")
@@ -312,8 +398,12 @@ def main(argv=None):
                         "first round only. Layer 0 costs +3.93 CE to drop against "
                         "a +0.02 median, so it is excluded by default.")
     g.add_argument("--max-kd-damage", type=float, default=0.5,
-                   help="stop if even the cheapest remaining cut exceeds this KD "
-                        "increase over the round's starting point")
+                   help="stop if even the cheapest remaining cut exceeds this "
+                        "increase over the round's starting point, in whichever "
+                        "metric selection is using (KD normally, CE when "
+                        "--kd-weight is 0). The two are on different scales -- "
+                        "one cut costs ~0.03 KD but ~0.02 CE -- so revisit this "
+                        "when switching.")
     g.add_argument("--select-batches", type=int, default=4,
                    help="dev batches per candidate when scoring. Every remaining "
                         "layer is scored each round, so this is the dominant "
@@ -336,7 +426,15 @@ def main(argv=None):
     g.add_argument("--batch-tokens", type=int, default=16384)
     g.add_argument("--max-batch-size", type=int, default=128)
     g.add_argument("--grad-accum", type=int, default=1)
-    g.add_argument("--kd-weight", type=float, default=1.0)
+    g.add_argument("--kd-weight", type=float, default=1.0,
+                   help="0 disables KD entirely: recovery becomes pure CE and "
+                        "layer selection switches to CE as well.")
+    g.add_argument("--kd-reverse", action="store_true",
+                   help="minimise KL(student || teacher) instead of "
+                        "KL(teacher || student): mode-seeking rather than "
+                        "mode-covering, which is usually the better "
+                        "compromise once capacity is the binding "
+                        "constraint. Reported metrics stay FORWARD KL.")
     g.add_argument("--ce-weight", type=float, default=0.05,
                    help="ground-truth CE alongside KD. 0.05 puts CE at ~30%% of "
                         "the gradient after a single-layer cut (measured); it is "
@@ -377,8 +475,19 @@ def main(argv=None):
     train_ds = wrap(CodecManifestDataset(args.train_manifest, args.data_root, **ds_kw))
     dev_ds = wrap(CodecManifestDataset(args.dev_manifest, args.data_root, **ds_kw))
 
+    use_cfg = args.teacher_guidance_scale > 0
+    if use_cfg and args.kd_weight == 0:
+        raise SystemExit("--teacher-guidance-scale with --kd-weight 0 is pointless: "
+                         "the CFG teacher costs two forwards per step and nothing "
+                         "consumes its output.")
+    if use_cfg and args.temperature != 1.0:
+        raise SystemExit("--teacher-guidance-scale requires --temperature 1: the "
+                         "mixed target is already a normalised distribution.")
+    tfn = make_cfg_teacher(args.teacher_guidance_scale,
+                           student.config.audio_mask_id) if use_cfg else None
     mk = lambda ds, bt, sh, nw: build_loader(  # noqa: E731
-        ds, proc, bt, args.max_batch_size, sh, args.seed, nw, args.prefix_blocked)
+        ds, proc, bt, args.max_batch_size, sh, args.seed, nw,
+        args.prefix_blocked, cfg_teacher=use_cfg)
     train_loader = mk(train_ds, args.batch_tokens, True, args.num_workers)
     # num_workers=0: the eval helpers pin the RNG, and worker processes draw
     # their masks outside that seeding.
@@ -397,11 +506,50 @@ def main(argv=None):
     print(f"prompt split: <= {args.max_prompt_ratio:g} of the utterance, "
           f"target floor {args.min_target_seconds:g}s ({min_tgt} frames)")
     print(f"attention: {'PREFIX-BLOCKED (matches stage-2 deployment)' if args.prefix_blocked else 'full bidirectional'}")
+    print(f"teacher: {args.teacher or args.model}"
+          + (f", running CFG at w={args.teacher_guidance_scale:g} "
+             f"(student stays a single pass)" if use_cfg else ""))
     print(f"loss: kd {args.kd_weight} + ce {args.ce_weight}\n")
 
+    if args.kd_weight == 0 and args.ce_weight == 0:
+        raise SystemExit("both --kd-weight and --ce-weight are 0: no training signal")
+
+    # Selection has to agree with the objective. KD is normally the sharper
+    # signal -- one dropped layer moves CE by 0.3% but KD by 5.5x -- but with
+    # --kd-weight 0 there is no KD term being optimised, so ranking layers by it
+    # would choose cuts for a loss the recovery never sees.
+    select_metric = "ce" if args.kd_weight == 0 else "kd"
+    need_teacher = args.kd_weight > 0
+    if select_metric == "ce":
+        def score():
+            return distill.evaluate_loss(student, dev_loader, device,
+                                         args.select_batches)
+    else:
+        def score():
+            return evaluate_kd(student, teacher, dev_loader, device, w,
+                               args.select_batches, teacher_logits_fn=tfn)
+    print(f"layer selection metric: {select_metric.upper()}"
+          + ("  (--kd-weight is 0, so KD is not being optimised)"
+             if select_metric == "ce" else ""))
+
     teacher_ce = distill.evaluate_loss(teacher, dev_loader, device, args.dev_batches)
-    report = {"args": vars(args), "teacher_ce": teacher_ce, "rounds": []}
-    print(f"teacher dev CE {teacher_ce:.4f}\n")
+    report = {"args": vars(args), "teacher_ce": teacher_ce,
+              "select_metric": select_metric, "rounds": []}
+    print(f"teacher dev CE {teacher_ce:.4f}")
+
+    if not need_teacher:
+        # Nothing after this point reads it: the loss is CE-only and selection
+        # scores the student against ground truth. Freeing it returns ~1.2 GiB
+        # (bf16) that the recovery can spend on batch size instead.
+        del teacher
+        teacher = None
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        elif device.type == "mps":
+            torch.mps.empty_cache()
+        print("teacher released after the reference eval (not needed for CE-only "
+              "recovery)")
+    print()
 
     protect = set(args.protect)
     removed = []          # original indices, for the record
@@ -409,20 +557,20 @@ def main(argv=None):
 
     for rnd in range(args.n_layers):
         t0 = time.time()
-        base_kd = evaluate_kd(student, teacher, dev_loader, device, w, args.select_batches)
+        base_kd = score()
+        M = select_metric.upper()
         print(f"=== round {rnd+1}/{args.n_layers}: {len(student.llm.layers)} layers, "
-              f"KD {base_kd:.4f} ===")
+              f"{M} {base_kd:.4f} ===")
 
         prot_now = {alive.index(i) for i in protect if i in alive}
-        ranked = score_layers(student, teacher, dev_loader, device, w,
-                              args.select_batches, prot_now)
+        ranked = score_layers(student, score, prot_now)
         best, best_kd = ranked[0]
         damage = best_kd - base_kd
         top = "  ".join(f"L{alive[i]}:{v-base_kd:+.3f}" for i, v in ranked[:6])
         print(f"  cheapest candidates (original numbering)  {top}")
 
         if damage > args.max_kd_damage:
-            print(f"\nstopping: cheapest cut costs {damage:+.4f} KD, over the "
+            print(f"\nstopping: cheapest cut costs {damage:+.4f} {M}, over the "
                   f"--max-kd-damage {args.max_kd_damage} gate.")
             # The cut before this one was therefore the last, but it only got the
             # short recovery -- the ladder did not know it was ending. Give the
@@ -432,27 +580,28 @@ def main(argv=None):
                       f"({final_steps} steps) on the {len(student.llm.layers)}-layer model")
                 cfg = distill.DistillConfig(
                     steps=final_steps, lr=args.lr, grad_accum=args.grad_accum,
-                    kd_weight=args.kd_weight, ce_weight=args.ce_weight,
+                    kd_weight=args.kd_weight, kd_reverse=args.kd_reverse, ce_weight=args.ce_weight,
                     hidden_weight=0.0, temperature=args.temperature,
                     log_every=args.log_every, eval_every=args.eval_every,
                     save_every=0, amp_dtype="bf16")
                 fin_dir = os.path.join(args.out_dir, "final_recovery")
                 os.makedirs(fin_dir, exist_ok=True)
                 rec = distill.distill(student, teacher, train_loader, dev_loader,
-                                      device, cfg, projection=None, out_dir=fin_dir)
+                                      device, cfg, projection=None, out_dir=fin_dir,
+                                      teacher_logits_fn=tfn)
                 student.eval()
                 report["final_recovery"] = {
                     "steps": final_steps,
                     "ce": rec.get("dev_loss"),
-                    "kd": evaluate_kd(student, teacher, dev_loader, device, w,
-                                      args.select_batches),
+                    "score": score(), "metric": select_metric,
                 }
-                print(f"  final: KD {report['final_recovery']['kd']:.4f}  "
+                print(f"  final: {select_metric.upper()} "
+                      f"{report['final_recovery']['score']:.4f}  "
                       f"CE {report['final_recovery']['ce']:.4f}")
             break
 
         orig = alive[best]
-        print(f"  removing layer {orig} (position {best}): KD {base_kd:.4f} -> "
+        print(f"  removing layer {orig} (position {best}): {M} {base_kd:.4f} -> "
               f"{best_kd:.4f} ({damage:+.4f})")
         remove_layer(student, best)
         alive.pop(best)
@@ -468,19 +617,20 @@ def main(argv=None):
         # correspondence to match against anyway.
         cfg = distill.DistillConfig(
             steps=round_steps, lr=args.lr, grad_accum=args.grad_accum,
-            kd_weight=args.kd_weight, ce_weight=args.ce_weight, hidden_weight=0.0,
+            kd_weight=args.kd_weight, kd_reverse=args.kd_reverse, ce_weight=args.ce_weight, hidden_weight=0.0,
             temperature=args.temperature, log_every=args.log_every,
             eval_every=args.eval_every, save_every=0, amp_dtype="bf16")
         rnd_dir = os.path.join(args.out_dir, f"round_{rnd+1:02d}_drop{orig}")
         os.makedirs(rnd_dir, exist_ok=True)
         rec = distill.distill(student, teacher, train_loader, dev_loader, device,
-                              cfg, projection=None, out_dir=rnd_dir)
+                              cfg, projection=None, out_dir=rnd_dir,
+                              teacher_logits_fn=tfn)
         student.eval()
 
-        post_kd = evaluate_kd(student, teacher, dev_loader, device, w, args.select_batches)
+        post_kd = score()
         post_ce = rec.get("dev_loss", float("nan"))
         n_par = surgery.count_parameters(student)
-        print(f"  after recovery: KD {post_kd:.4f} (was {best_kd:.4f} at surgery, "
+        print(f"  after recovery: {M} {post_kd:.4f} (was {best_kd:.4f} at surgery, "
               f"{base_kd:.4f} before)   CE {post_ce:.4f} vs teacher {teacher_ce:.4f}"
               f"   params {n_par/1e6:.1f}M")
 

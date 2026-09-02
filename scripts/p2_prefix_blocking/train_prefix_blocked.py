@@ -336,13 +336,41 @@ def logits_of(model, batch, attn):
     ).permute(0, 2, 1, 3)
 
 
-def weighted_kd(s_logits, t_logits, labels, w, temperature=1.0):
-    """Codebook-weighted KL(teacher || student) on loss-bearing positions."""
+LOG_FLOOR = -20.7   # log(1e-9)
+
+
+def weighted_kd(s_logits, t_logits, labels, w, temperature=1.0, reverse=False):
+    """Codebook-weighted KL on loss-bearing positions.
+
+    ``reverse=False`` (default) is KL(teacher || student) -- **mode-covering**.
+    It is weighted by the teacher's probability, so it punishes the student for
+    missing anything the teacher considers possible and costs nothing for mass
+    the student invents where the teacher has none.
+
+    ``reverse=True`` is KL(student || teacher) -- **mode-seeking**. Weighted by
+    the student's probability, it punishes exactly the opposite: mass the student
+    puts where the teacher would not, at the price of tolerating dropped modes.
+
+    The two agree when the student can represent the teacher. They diverge when
+    it cannot, and then forward KL prefers a spread-out compromise that samples
+    from regions the teacher assigns ~zero -- which for an iterative sampler means
+    committing a token the teacher would never have, and conditioning every later
+    step on it.
+
+    ``LOG_FLOOR`` matters only in reverse: `log p_t` is unbounded below, so a
+    student with any mass where the teacher has none would otherwise give an
+    infinite loss.
+    """
     mask = (labels != -100).float()
     t = temperature
     lps = torch.log_softmax(s_logits / t, dim=-1)
     lpt = torch.log_softmax(t_logits / t, dim=-1)
-    kl = (lpt.exp() * (lpt - lps)).sum(dim=-1)
+    if reverse:
+        ps = lps.exp()
+        kl = (ps * (lps - lpt.clamp_min(LOG_FLOOR))).sum(dim=-1)
+    else:
+        pt = lpt.exp()
+        kl = torch.where(pt > 0, pt * (lpt - lps), torch.zeros_like(pt)).sum(dim=-1)
     per_cb = (kl * mask).sum(dim=(0, 2)) / mask.sum(dim=(0, 2)).clamp(min=1.0)
     return (per_cb * w).sum() * t * t
 
@@ -447,6 +475,11 @@ def main():
     p.add_argument("--max-grad-norm", type=float, default=1.0)
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--kd-weight", type=float, default=1.0)
+    p.add_argument("--kd-reverse", action="store_true",
+                   help="minimise KL(student || teacher) instead of "
+                        "KL(teacher || student): mode-seeking rather "
+                        "than mode-covering. Validation still reports "
+                        "FORWARD KL so runs stay comparable.")
     p.add_argument("--ce-weight", type=float, default=0.0,
                    help="ground-truth CE, added to the KD term. CE is ~40x "
                         "larger than KD here, so useful values are small; "
@@ -577,7 +610,8 @@ def main():
             with torch.no_grad():
                 t_logits = logits_of(teacher, batch, full)
             s_logits = logits_of(student, batch, blocked)
-            kd = weighted_kd(s_logits, t_logits, batch["labels"], w, args.temperature)
+            kd = weighted_kd(s_logits, t_logits, batch["labels"], w,
+                             args.temperature, reverse=args.kd_reverse)
             # Ground-truth CE anchors the student to the data, so it cannot inherit
             # teacher quirks wholesale. Secondary by design -- see --ce-weight.
             ce = (weighted_ce(s_logits, batch["labels"], w)

@@ -51,6 +51,7 @@ class DistillConfig:
     kd_weight: float = 1.0
     ce_weight: float = 0.0
     hidden_weight: float = 0.0
+    kd_reverse: bool = False
     temperature: float = 1.0
     log_every: int = 50
     eval_every: int = 500
@@ -71,6 +72,9 @@ def _codebook_weights(model, device) -> torch.Tensor:
     return torch.tensor(model.normalized_audio_codebook_weights, device=device)
 
 
+LOG_FLOOR = -20.7   # log(1e-9)
+
+
 def _weighted_ce(logits: torch.Tensor, labels: torch.Tensor, w: torch.Tensor):
     """Reproduces ``OmniVoice.forward``'s loss: per-codebook mean, then weighted sum."""
     per_token = F.cross_entropy(
@@ -87,13 +91,29 @@ def _weighted_kd(
     labels: torch.Tensor,
     w: torch.Tensor,
     temperature: float = 1.0,
+    reverse: bool = False,
 ):
-    """Codebook-weighted KL(teacher || student) on loss-bearing positions."""
+    """Codebook-weighted KL on loss-bearing positions.
+
+    ``reverse=False`` is KL(teacher || student); ``True`` is KL(student || teacher).
+    """
     mask = (labels != -100).float()  # [B, C, S]
     t = temperature
     log_p_s = F.log_softmax(student_logits / t, dim=-1)
     log_p_t = F.log_softmax(teacher_logits / t, dim=-1)
-    kl = (log_p_t.exp() * (log_p_t - log_p_s)).sum(dim=-1)  # [B, C, S]
+    if reverse:
+        # KL(student || teacher): mode-seeking. Weighted by the student's own
+        # probability, so it punishes mass the student places where the teacher
+        # would not, rather than mass it fails to cover. For a capacity-limited
+        # student that is usually the better compromise -- forward KL prefers a
+        # spread-out fit that samples from regions the teacher rates ~zero, and
+        # in an iterative sampler one such commit conditions every later step.
+        # LOG_FLOOR keeps it finite where the teacher's probability underflows.
+        kl = (log_p_s.exp() * (log_p_s - log_p_t.clamp_min(LOG_FLOOR))).sum(dim=-1)
+    else:
+        p_t = log_p_t.exp()
+        kl = torch.where(p_t > 0, p_t * (log_p_t - log_p_s),
+                         torch.zeros_like(p_t)).sum(dim=-1)  # [B, C, S]
     per_cb = (kl * mask).sum(dim=(0, 2)) / mask.sum(dim=(0, 2)).clamp(min=1.0)
     return (per_cb * w).sum() * (t * t)
 
@@ -171,24 +191,45 @@ def distill(
     projection: Optional[torch.Tensor] = None,
     out_dir: Optional[str] = None,
     verbose: bool = True,
+    teacher_logits_fn=None,
 ) -> Dict[str, float]:
     """Run KD recovery. Returns a summary with the final dev loss.
 
     ``projection`` is the cumulative ``[d_teacher, d_student]`` map from the
     original teacher's residual basis to the student's, required only when
     ``cfg.hidden_weight > 0``.
+
+    ``teacher_logits_fn(teacher, batch) -> [B, C, S, V]`` overrides how the KD
+    target is produced. It exists so the teacher can run classifier-free guidance
+    (two branches, mixed) while the student runs a single conditional pass -- the
+    setup needed to prune a guidance-distilled student against an ORIGINAL,
+    un-distilled teacher. Incompatible with ``hidden_weight > 0``, which needs the
+    teacher's per-boundary hidden states.
     """
+    if teacher_logits_fn is not None and cfg.hidden_weight > 0:
+        raise ValueError("teacher_logits_fn cannot be combined with hidden_weight > 0")
     use_hidden = cfg.hidden_weight > 0.0
     if use_hidden and projection is None:
         raise ValueError("hidden_weight > 0 requires a cumulative projection")
+
+    # With no KD and no hidden matching the teacher contributes nothing to the
+    # loss, so running it every step is pure waste -- and with a CFG teacher it is
+    # two wasted forwards. ``teacher`` may then be None.
+    need_teacher = cfg.kd_weight > 0.0 or use_hidden
+    if not need_teacher and verbose:
+        print("  teacher forward SKIPPED (kd_weight=0, hidden_weight=0)")
+    if need_teacher and teacher is None:
+        raise ValueError("a teacher is required unless kd_weight and hidden_weight "
+                         "are both 0")
 
     amp = device.type == "cuda"
     amp_dtype = torch.bfloat16 if cfg.amp_dtype == "bf16" else torch.float16
     scaler = torch.amp.GradScaler("cuda", enabled=amp and amp_dtype is torch.float16)
 
-    teacher.eval()
-    for p in teacher.parameters():
-        p.requires_grad_(False)
+    if teacher is not None:
+        teacher.eval()
+        for p in teacher.parameters():
+            p.requires_grad_(False)
     student.train()
 
     decay, no_decay = [], []
@@ -229,16 +270,24 @@ def distill(
 
         with torch.autocast(device.type, dtype=amp_dtype, enabled=amp):
             with torch.no_grad():
-                t_hs, t_last = _hidden_states(
-                    teacher, batch, output_hidden_states=use_hidden
-                )
-                t_logits = _audio_logits(teacher, t_last)
+                if not need_teacher:
+                    t_hs = t_logits = None
+                elif teacher_logits_fn is not None:
+                    t_hs, t_logits = None, teacher_logits_fn(teacher, batch)
+                else:
+                    t_hs, t_last = _hidden_states(
+                        teacher, batch, output_hidden_states=use_hidden
+                    )
+                    t_logits = _audio_logits(teacher, t_last)
             s_hs, s_last = _hidden_states(
                 student, batch, output_hidden_states=use_hidden
             )
             s_logits = _audio_logits(student, s_last)
 
-            kd = _weighted_kd(s_logits, t_logits, batch["labels"], w, cfg.temperature)
+            kd = (_weighted_kd(s_logits, t_logits, batch["labels"], w,
+                               cfg.temperature, reverse=cfg.kd_reverse)
+                  if t_logits is not None
+                  else torch.zeros((), device=device))
             ce = (
                 _weighted_ce(s_logits, batch["labels"], w)
                 if cfg.ce_weight > 0
