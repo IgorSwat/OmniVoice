@@ -461,3 +461,94 @@ Practical consequences:
   them directly. The real headroom is that a multilingual-trained teacher represents English
   non-compactly *for English*; a specialized student should learn a tighter code — genuine slack,
   but unquantified.
+
+## 12. Localized prune damage: FFN in early layers beats every other axis
+
+Measured on `models/p4/depth_ce_only` (20 layers, dev CE 4.6365), one place cut at a time,
+no repair and no retraining. Damage per 10M parameters removed, at each axis's cheapest layer:
+
+| axis | best layer | dCE | saved | dCE per 10M |
+|---|---|---|---|---|
+| FFN → 50% | 0 | +0.0022 | 4.72M | **0.0046** |
+| whole layer (depth) | 3 | +0.0307 | 15.73M | 0.0195 |
+| attention 4/8 groups | 5 | +0.0091 | 3.15M | 0.0289 |
+| residual width → 768 | 4 | +0.0275 | 3.93M | 0.0700 |
+
+**Residual width has no safe spots.** Per-layer damage spans only 0.028–0.070 (2.5×, layer 0
+excepted at 0.103) and is *additive*: the 20 independent cuts sum to 0.983 against 0.837 for
+cutting all layers at once. No subset is cheap and no interaction can be exploited.
+
+**FFN does have safe spots — a 73× spread.** Damage rises almost monotonically with depth:
+layers 0–4 cost 0.002–0.009 each, layers 15/16 cost 0.158/0.121. §11's uniform-FFN survey
+(+0.2935 at keep 0.75) averaged the cheap early band together with these expensive deep layers
+and so ranked the axis far too low.
+
+Layer 0 inverts across axes: the *most* expensive place to cut attention (+0.159) or width
+(+0.103), the *cheapest* for FFN (+0.0022). It needs its attention and full residual access;
+its feed-forward does almost nothing.
+
+Joint cuts (super-additivity grows with group size, 1.35× at 5 layers, 1.58× at 9):
+
+| cut | dCE | saved | dCE per 10M |
+|---|---|---|---|
+| **layers 0–4 @50%** | **+0.0396** | **23.6M** | **0.0168** |
+| layers 0–8 @50% | +0.1609 | 42.5M | 0.0379 |
+| layers 0–13 @50% | +0.3632 | 66.1M | 0.0550 |
+| layers 0–4 @25% | +0.1597 | 35.4M | 0.0451 |
+| layers 0–8 @25% | +0.5339 | 63.7M | 0.0838 |
+| layers 0–4 @12.5% | +0.3775 | 41.3M | 0.0914 |
+
+Only `layers 0–4 @50%` beats depth's best cut. Widening the band is better than deepening it:
+at equal damage (~0.160) the wider shallow cut yields 42.5M against 35.4M. 50% retention is the
+right depth; below it the axis collapses.
+
+**Why `rung_704` failed is now clear.** It took the whole 1024→704 cut as ONE rung
+(`--widths 704`, 4000 steps), opening a 1.131-nat hole, where the depth ladder never exceeded
+0.161 per round and recovered after each. Its recovery plateaued from step 1000 on; fitting the
+16 evals gives excess ∝ step^-0.19, so 40× more steps would recover only a further 0.08 nats.
+That was a methodology mismatch, not proof the width axis is unrecoverable — but §12 shows the
+axis is not worth the ladder anyway.
+
+⚠️ Repair needs enough calibration data: with 96 samples the sequential least-squares solves come
+back underdetermined and make the model *worse* by ~0.6 nats at every width. Use ≥192.
+
+## 13. Heterogeneous per-layer FFN: implementation and measured speedup
+
+**No architecture work is needed.** `Qwen3MLP.forward` references only its three `nn.Linear`
+modules and `Qwen3Attention.forward` reshapes with `(*input_shape, -1, self.head_dim)`, inferring
+head count. Both are shape-agnostic, so layers may differ in FFN width or head count while keeping
+the same `hidden_size` interface to the residual stream. Physically swapping in smaller `nn.Linear`
+modules is the entire mechanism. Verified: layer-5 attention 8→4 groups reproduced the masked
+survey estimate exactly (+0.0091).
+
+The only requirement is reload. `from_pretrained` builds from config before loading weights, so it
+constructs uniform MLPs and hits a shape mismatch. A config field (`llm_ffn_sizes`) plus a ~4-line
+resize hook in `OmniVoice.__init__` fixes it; save→reload round-trip reproduced CE 4.6761 exactly.
+
+Per-layer *residual width* is the exception: it needs slicing and zero-padding in the layer forward
+(rotate the stream globally, then each layer reads its own leading k coordinates). No new
+parameters, but it does touch forward code — and §12 shows it is the worst axis anyway.
+
+**Speedup is modest** (M4 Pro MPS, 5s/5s operating point, 16 steps, CFG on, from `depth_ce_only`):
+
+| model | params | dCE | LM ms/call | LM speedup | theoretical | realized | end-to-end RTF |
+|---|---|---|---|---|---|---|---|
+| base | 486.7M | — | 104.7 | — | — | — | 0.371 |
+| FFN L0–4 @50% | 463.1M | +0.0396 | 100.3 | 4.4% | 7.5% | 58% | 0.353 (5.1%) |
+| FFN L0–8 @50% | 444.3M | +0.1584 | 96.8 | 8.2% | 13.5% | 60% | 0.344 (7.8%) |
+
+Only ~60% of the theoretical FLOP saving is realized — these matmuls are launch- and
+bandwidth-bound at batch 2 on MPS. CUDA at larger batch may realize more; unmeasured.
+
+**Damage per 1% of LM compute removed** — the number that decides what to cut next:
+
+| cut | dCE per 1% |
+|---|---|
+| depth round 1 (28→27 layers, cheap era) | 0.0086 |
+| **FFN L0–4 @50%** | **0.0090** |
+| FFN L0–8 @50% | 0.0194 |
+| depth round 8 (21→20 layers, current margin) | 0.0339 |
+
+FFN's cheap band is as efficient as depth's cheap band *was*, and 3.8× better than the next depth
+cut would be. Depth's cheap layers are spent; FFN's are untouched. But the absolute gain is small:
+this axis is mostly a footprint win, like the vocabulary cut, not a latency win.

@@ -147,12 +147,20 @@ def build_loader(ds, processor, batch_tokens, max_batch_size, shuffle, seed,
                  num_workers, prefix_blocked, cfg_teacher=False):
     """`build_dataloader`, plus the prefix block and the boundary it needs.
 
-    The boundary is `audio_start + prompt_length`: `audio_start` is the first True
-    in `audio_mask` (style and text precede it), and `prompt_length` is the value
-    `PromptSplitDataset` injected as `clean_start_token_idx`. Blocking inside the
-    collate function means every consumer downstream -- the training loop, the CE
-    eval, the KD scorer -- sees the deployment topology without needing to know
-    about it.
+    The prompt length comes from `_prompt_frames` and is applied by pinning the
+    processor's `prompt_ratio_range` for that one sample, so `drop_cond` and the
+    rest of the original recipe keep working untouched. The prefix boundary is
+    then `audio_start + prompt_length`, where `audio_start` is the first True in
+    `audio_mask` (style and text precede it).
+
+    `drop_cond` samples are the exception: the processor makes them target-only,
+    so they have no prefix and get `prefix_len = 0`. They are the unconditional
+    path -- the same topology CFG's unconditional branch uses at inference -- and
+    must keep receiving gradient.
+
+    Blocking inside the collate function means every consumer downstream -- the
+    training loop, the CE eval, the layer scorer -- sees the deployment topology
+    without needing to know about it.
     """
     from torch.utils.data import DataLoader
     from omnivoice.data.collator import PaddingDataCollator
@@ -443,7 +451,20 @@ def main(argv=None):
                         "one you keep, so it is usually worth training longer.")
     g.add_argument("--final-epochs", type=float, default=None,
                    help="epochs for the last recovery (default: same as --epochs)")
-    g.add_argument("--lr", type=float, default=1e-4)
+    g.add_argument("--lr", type=float, default=1e-4,
+                   help="peak LR. With --lr-damage-ref it is the LR at that "
+                        "reference damage rather than a fixed value.")
+    g.add_argument("--lr-damage-ref", type=float, default=0.0,
+                   help="scale each round's peak LR as --lr * sqrt(damage / this); "
+                        "0 keeps --lr fixed. AdamW normalises by the gradient RMS, "
+                        "so a step displaces weights by ~lr regardless of gradient "
+                        "scale, while surgery displaces them by ||d|| ~ sqrt(damage) "
+                        "-- hence the square root. Damage is in the SELECTION "
+                        "metric, so re-anchor when switching between KD and CE "
+                        "(one cut reads ~0.03 KD but ~0.02 CE).")
+    g.add_argument("--lr-bounds", type=float, nargs=2, default=[1.5e-5, 8e-5],
+                   metavar=("MIN", "MAX"),
+                   help="clamp for the scaled LR")
     g.add_argument("--batch-tokens", type=int, default=16384)
     g.add_argument("--max-batch-size", type=int, default=128)
     g.add_argument("--grad-accum", type=int, default=1)
@@ -574,6 +595,7 @@ def main(argv=None):
     print()
 
     protect = set(args.protect)
+    round_lr = args.lr
     removed = []          # original indices, for the record
     alive = list(range(L0))
 
@@ -601,7 +623,7 @@ def main(argv=None):
                 print(f"running the extended final recovery anyway "
                       f"({final_steps} steps) on the {len(student.llm.layers)}-layer model")
                 cfg = distill.DistillConfig(
-                    steps=final_steps, lr=args.lr, grad_accum=args.grad_accum,
+                    steps=final_steps, lr=round_lr, grad_accum=args.grad_accum,
                     kd_weight=args.kd_weight, kd_reverse=args.kd_reverse, ce_weight=args.ce_weight,
                     hidden_weight=0.0, temperature=args.temperature,
                     log_every=args.log_every, eval_every=args.eval_every,
@@ -629,6 +651,11 @@ def main(argv=None):
         alive.pop(best)
         removed.append(orig)
 
+        if args.lr_damage_ref > 0:
+            round_lr = min(max(args.lr * (damage / args.lr_damage_ref) ** 0.5,
+                               args.lr_bounds[0]), args.lr_bounds[1])
+            print(f"  lr {round_lr:.2e} for {M} damage {damage:+.4f}")
+
         is_last = rnd == args.n_layers - 1
         round_steps = final_steps if is_last else steps
         if is_last and final_steps != steps:
@@ -638,7 +665,7 @@ def main(argv=None):
         # wrong once the block is applied. Depth pruning has no boundary
         # correspondence to match against anyway.
         cfg = distill.DistillConfig(
-            steps=round_steps, lr=args.lr, grad_accum=args.grad_accum,
+            steps=round_steps, lr=round_lr, grad_accum=args.grad_accum,
             kd_weight=args.kd_weight, kd_reverse=args.kd_reverse, ce_weight=args.ce_weight, hidden_weight=0.0,
             temperature=args.temperature, log_every=args.log_every,
             eval_every=args.eval_every, save_every=0, amp_dtype="bf16")
@@ -660,7 +687,7 @@ def main(argv=None):
         report["rounds"].append({
             "round": rnd + 1, "removed_original_index": orig,
             "layers_left": len(student.llm.layers), "params": n_par,
-            "steps": round_steps,
+            "steps": round_steps, "lr": round_lr,
             "kd_before": base_kd, "kd_after_surgery": best_kd,
             "kd_damage": damage, "kd_after_recovery": post_kd,
             "ce_after_recovery": post_ce,
