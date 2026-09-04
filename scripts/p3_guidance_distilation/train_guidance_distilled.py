@@ -21,9 +21,11 @@ conditional one. Two loss terms, mirroring `train_prefix_blocked.py`:
   KD  KL(CFG-mixed teacher || student), codebook-weighted, masked positions only
   CE  ground-truth cross-entropy, off by default -- see --ce-weight
 
-Composing with stage 2: point BOTH --teacher and --model at your prefix-blocked
-checkpoint and pass --prefix-blocked. The teacher then differs from the student
-only by having CFG, which isolates guidance removal from every other change.
+Training follows the ORIGINAL scheme, matching stage-4 recovery: the prompt is a
+clean prefix of the same utterance, `U(0, --max-prompt-ratio)` of its length with at
+least `--min-target-seconds` left to predict. Point BOTH --teacher and --model at a
+prefix-blocked checkpoint and pass --prefix-blocked to isolate guidance removal from
+every other change.
 
     # continue from a prefix-blocked checkpoint, isolating the CFG change
     python scripts/p3_guidance_distilation/train_guidance_distilled.py \\
@@ -48,7 +50,7 @@ import time
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _SCRIPTS = os.path.dirname(_HERE)
@@ -68,16 +70,77 @@ from transformers import AutoTokenizer  # noqa: E402
 from omnivoice.models.omnivoice import (  # noqa: E402
     OmniVoice, _combine_text, _resolve_model_path, _tokenize_with_nonverbal_tags,
 )
+from p4_width_pruning.manifest import codec_path  # noqa: E402
+from p4_width_pruning.progressive_depth_prune import FRAME_RATE  # noqa: E402
 from train_prefix_blocked import (  # noqa: E402
-    DTYPES, ClonePairDataset, LengthGroupedBatchSampler, build_masks,
-    clone_pair_lengths, lr_at, read_manifest, row_stats, to_device,
-    weighted_ce,
+    DTYPES, LengthGroupedBatchSampler, build_masks, lr_at, read_manifest,
+    row_stats, to_device, weighted_ce,
 )
 
 
 # ---------------------------------------------------------------------------
 # Data: the conditional sequence AND the unconditional (target-only) one
 # ---------------------------------------------------------------------------
+
+
+class PromptSplitDataset(Dataset):
+    """Same-utterance completion, matching the original training scheme.
+
+    The processor draws ``prompt_ratio ~ U(0, max_prompt_ratio)`` and takes
+    ``int(T * prompt_ratio)`` frames as a clean prefix; the remainder is the target.
+    The floor keeps at least ``min_target_frames`` to predict, which binds only on
+    short utterances. This is the layout the original model and the stage-4 recovery
+    both train on -- NOT the paired cross-utterance layout stage 2 uses.
+
+    Yields the same keys the collator expects, with ``ref_text=None`` so
+    ``_combine_text`` passes the transcript through unchanged: the text spans the
+    whole utterance, prefix included, exactly as the processor builds it.
+    """
+
+    def __init__(self, manifest, data_root="data", max_frames=750,
+                 min_target_frames=50, max_prompt_ratio=0.3,
+                 only_speakers=None, exclude_speakers=None):
+        rows = manifest if isinstance(manifest, list) else read_manifest(manifest)
+        if only_speakers is not None:
+            rows = [r for r in rows if r["speaker_id"] in only_speakers]
+        if exclude_speakers:
+            rows = [r for r in rows if r["speaker_id"] not in exclude_speakers]
+        self.rows = rows
+        self.data_root = data_root
+        self.max_frames = max_frames
+        self.min_target_frames = min_target_frames
+        self.max_prompt_ratio = max_prompt_ratio
+
+    def __len__(self):
+        return len(self.rows)
+
+    def __getitem__(self, i):
+        r = self.rows[i]
+        t = np.load(codec_path(r["name"], self.data_root)).astype(np.int64)
+        t = torch.from_numpy(t[:, : self.max_frames])
+        T = t.shape[1]
+        cap = max(0, T - self.min_target_frames)
+        p = min(int(T * random.uniform(0.0, self.max_prompt_ratio)), cap)
+        return {
+            "ref_codec": t[:, :p],
+            "target_codec": t[:, p:],
+            "text": r["transcription"],
+            "ref_text": None,
+            "lang": r.get("language", "en"),
+        }
+
+
+def prompt_split_lengths(ds, stats, max_frames, style_tokens=24, slack=8):
+    """Padded length the collator will produce: style + text + the whole utterance.
+
+    The prompt/target split moves the boundary but not the total, so unlike the
+    paired layout there is nothing random to bound -- this is exact, not pessimistic.
+    """
+    out = []
+    for r in ds.rows:
+        frames, toks = stats.get(r["name"], (0, 0))
+        out.append(style_tokens + toks + min(frames, max_frames) + slack)
+    return out
 
 
 class GuidanceCollator:
@@ -355,7 +418,6 @@ def main():
                         "prefix-blocked checkpoint to continue from stage 2.")
     p.add_argument("--train-manifest", default="data/dataset_without_dev.csv")
     p.add_argument("--dev-manifest", default="data/dev_set.csv")
-    p.add_argument("--dev-ref-manifest", default=None)
     p.add_argument("--data-root", default="data")
     p.add_argument("--no-speaker-holdout", dest="speaker_holdout",
                    action="store_false",
@@ -370,10 +432,13 @@ def main():
     p.add_argument("--device", default=None)
     p.add_argument("--dtype", default="fp32", choices=list(DTYPES))
     p.add_argument("--teacher-dtype", default="bf16", choices=list(DTYPES))
-    p.add_argument("--ref-cap", type=int, default=150)
     p.add_argument("--max-frames", type=int, default=750)
+    p.add_argument("--min-target-seconds", type=float, default=2.0,
+                   help="hard floor on the target region; binds only on short "
+                        "utterances (below ~2.9 s at the default 0.3 cap)")
+    p.add_argument("--max-prompt-ratio", type=float, default=0.3)
     p.add_argument("--batch-size", type=int, default=8)
-    p.add_argument("--batch-tokens", type=int, default=0, metavar="N",
+    p.add_argument("--batch-tokens", type=int, default=16384, metavar="N",
                    help="length-grouped batching with a padded-token budget per "
                         "batch (0 = fixed --batch-size). Memory scales with "
                         "batch_size * max_len, so this is what actually bounds it.")
@@ -438,13 +503,15 @@ def main():
     C = student.config.num_audio_codebook
     w = torch.tensor(student.normalized_audio_codebook_weights, device=device)
     coll = GuidanceCollator(tok, C, mask_id)
+    min_tgt = int(round(args.min_target_seconds * FRAME_RATE))
 
-    def make(manifest, shuffle, workers, ref_manifest=None, **kw):
-        ds = ClonePairDataset(manifest, args.data_root, ref_manifest=ref_manifest,
-                              max_frames=args.max_frames, ref_cap=args.ref_cap, **kw)
+    def make(manifest, shuffle, workers, **kw):
+        ds = PromptSplitDataset(manifest, args.data_root, max_frames=args.max_frames,
+                                min_target_frames=min_tgt,
+                                max_prompt_ratio=args.max_prompt_ratio, **kw)
         if args.batch_tokens > 0:
-            lengths = clone_pair_lengths(ds, row_stats(manifest, args.data_root, tok),
-                                         args.ref_cap, args.max_frames)
+            lengths = prompt_split_lengths(ds, row_stats(manifest, args.data_root, tok),
+                                           args.max_frames)
             bs = LengthGroupedBatchSampler(lengths, args.batch_tokens,
                                            max_batch_size=args.max_batch_size,
                                            shuffle=shuffle, seed=args.seed)
@@ -459,15 +526,12 @@ def main():
                               drop_last=shuffle), None
 
     val_speakers = None
-    ref_rows = read_manifest(args.dev_ref_manifest or args.train_manifest)
     if args.speaker_holdout:
         val_speakers = {r["speaker_id"] for r in read_manifest(args.dev_manifest)}
-        ref_rows = [r for r in ref_rows if r["speaker_id"] in val_speakers]
 
     train_ds, train_dl, train_bs = make(args.train_manifest, True, args.num_workers,
                                         exclude_speakers=val_speakers)
-    dev_ds, dev_dl, _ = make(args.dev_manifest, False, 0,
-                             ref_manifest=read_manifest(args.dev_manifest) + ref_rows)
+    dev_ds, dev_dl, _ = make(args.dev_manifest, False, 0)
     print(f"train pairs {len(train_ds)}   val pairs {len(dev_ds)}"
           f"{'  (validation voices unseen in training)' if args.speaker_holdout else ''}")
     if len(dev_ds) == 0:
