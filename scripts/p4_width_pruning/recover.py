@@ -25,8 +25,10 @@ because it loads the teacher before the first cut.
 import argparse
 import json
 import os
+import random
 import sys
 import time
+from collections import defaultdict
 
 import torch
 
@@ -34,6 +36,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(_HERE))
 sys.path.insert(0, os.path.dirname(os.path.dirname(_HERE)))
 
+from torch.utils.data import Dataset  # noqa: E402
 from transformers import AutoTokenizer  # noqa: E402
 
 from omnivoice.models.omnivoice import OmniVoice, _resolve_model_path  # noqa: E402
@@ -45,6 +48,63 @@ from p4_width_pruning.progressive_depth_prune import (  # noqa: E402
     DTYPES, FRAME_RATE, PromptSplitDataset, build_loader, evaluate_kd,
     make_cfg_teacher,
 )
+
+
+class MixedReferenceDataset(Dataset):
+    """Half same-utterance prefix, half a separate reference clip by the same speaker.
+
+    `PromptSplitDataset` always takes the prompt from the target utterance itself,
+    which is the original training scheme but not the deployment one: real cloning
+    supplies a different clip. Measured on the dev set, the pruned model's CE gap to
+    p2 is ~11x larger under the cross-utterance layout (+0.124) than under the
+    same-utterance one (+0.011), so the two are not interchangeable.
+
+    Odd indices concatenate another utterance by the same speaker in front of the
+    target -- codec and transcript both -- and mark the whole reference as the prompt,
+    which reproduces the inference layout through the unmodified processor. Even
+    indices keep the original scheme. Splitting by index rather than at random keeps
+    `lengths` exact for the token-budget sampler.
+    """
+
+    def __init__(self, base, min_target_frames, max_prompt_ratio, ref_cap):
+        self.base = base
+        self.min_target_frames = min_target_frames
+        self.max_prompt_ratio = max_prompt_ratio
+        self.ref_cap = ref_cap
+        self.by_speaker = defaultdict(list)
+        for i, r in enumerate(base.rows):
+            self.by_speaker[r["speaker_id"]].append(i)
+
+    def __len__(self):
+        return len(self.base)
+
+    def __getitem__(self, i):
+        s = self.base[i]
+        pool = [j for j in self.by_speaker[self.base.rows[i]["speaker_id"]] if j != i]
+        if i % 2 and pool:
+            ref = self.base[random.choice(pool)]
+            clip = ref["audio_tokens"][:, : self.ref_cap]
+            s["audio_tokens"] = torch.cat([clip, s["audio_tokens"]], dim=1)
+            s["label"] = dict(s["label"],
+                              text=f"{ref['label']['text']} {s['label']['text']}")
+            s["_prompt_frames"] = clip.shape[1]
+        else:
+            T = s["audio_tokens"].shape[1]
+            cap = max(0, T - self.min_target_frames)
+            s["_prompt_frames"] = min(
+                int(T * random.uniform(0.0, self.max_prompt_ratio)), cap)
+        return s
+
+    @property
+    def lengths(self):
+        # Odd rows may grow by up to ref_cap; budget for it even when the speaker
+        # turns out to have no second utterance, so a batch can never overflow.
+        return [n + (self.ref_cap if i % 2 else 0)
+                for i, n in enumerate(self.base.lengths)]
+
+    @property
+    def hours(self):
+        return self.base.hours
 
 
 def main(argv=None):
@@ -74,6 +134,16 @@ def main(argv=None):
     g = p.add_argument_group("prompt split")
     g.add_argument("--min-target-seconds", type=float, default=2.0)
     g.add_argument("--max-prompt-ratio", type=float, default=0.3)
+    g.add_argument("--cross-utterance", action="store_true",
+                   help="train on a 50/50 mix: half the samples keep the "
+                        "same-utterance prefix, half use a separate clip by the "
+                        "same speaker as the reference, which is the layout "
+                        "inference uses. Applies to TRAINING only -- the dev set "
+                        "stays same-utterance so its numbers remain comparable "
+                        "with earlier runs.")
+    g.add_argument("--ref-cap", type=int, default=150,
+                   help="frames of the reference clip kept when --cross-utterance "
+                        "is set (150 = 6s, matching stage 2)")
     g.add_argument("--prefix-blocked", action="store_true",
                    help="train and evaluate with prefix->target attention cut. "
                         "Must match how the model was pruned and how it is deployed.")
@@ -138,7 +208,10 @@ def main(argv=None):
              "max_frames": args.max_frames}
     min_tgt = int(round(args.min_target_seconds * FRAME_RATE))
     wrap = lambda d: PromptSplitDataset(d, min_tgt, args.max_prompt_ratio)  # noqa: E731
-    train_ds = wrap(CodecManifestDataset(args.train_manifest, args.data_root, **ds_kw))
+    train_base = CodecManifestDataset(args.train_manifest, args.data_root, **ds_kw)
+    train_ds = (MixedReferenceDataset(train_base, min_tgt, args.max_prompt_ratio,
+                                      args.ref_cap)
+                if args.cross_utterance else wrap(train_base))
     dev_ds = wrap(CodecManifestDataset(args.dev_manifest, args.data_root, **ds_kw))
 
     tfn = make_cfg_teacher(args.teacher_guidance_scale,
