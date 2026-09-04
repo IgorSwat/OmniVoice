@@ -237,14 +237,25 @@ class GuidanceCollator:
 # ---------------------------------------------------------------------------
 
 
-def logits_of(model, ids, audio_mask, attn, position_ids):
+def logits_of(model, ids, audio_mask, attn, position_ids, uncond_head=False):
+    """Conditional logits, or the two-head CFG mixture when `uncond_head`.
+
+    With the auxiliary head the student keeps `audio_heads` as its conditional
+    distribution and predicts the unconditional branch from the SAME hidden state,
+    mixing analytically. The mixture is what the KD loss then matches, so errors in
+    the predicted `log p_u` are weighted by how much they actually move the guided
+    distribution.
+    """
     e = model._prepare_embed_inputs(ids, audio_mask)
     h = model.llm(inputs_embeds=e, attention_mask=attn,
                   position_ids=position_ids, return_dict=True).last_hidden_state
     b, s, _ = h.shape
-    return model.audio_heads(h).view(
+    c = model.audio_heads(h).view(
         b, s, model.config.num_audio_codebook, model.config.audio_vocab_size
     ).permute(0, 2, 1, 3)
+    if not uncond_head:
+        return c
+    return c, model.uncond_logits(h)
 
 
 def gather_target(logits, tgt_index):
@@ -361,9 +372,16 @@ def forward_pair(teacher, student, batch, args, mask_id, topk=0,
         if not want_teacher_cond:
             t_c = None          # training does not read it; eval does
 
-    s = gather_target(
-        logits_of(student, batch["input_ids"], batch["audio_mask"],
-                  cond_attn, batch["position_ids"]), batch["tgt_index"])
+    if getattr(student, "uncond_heads", None) is not None:
+        s_c, s_u = logits_of(student, batch["input_ids"], batch["audio_mask"],
+                             cond_attn, batch["position_ids"], uncond_head=True)
+        s = cfg_log_probs(gather_target(s_c, batch["tgt_index"]),
+                          gather_target(s_u, batch["tgt_index"]),
+                          args.guidance_scale, mask_id)
+    else:
+        s = gather_target(
+            logits_of(student, batch["input_ids"], batch["audio_mask"],
+                      cond_attn, batch["position_ids"]), batch["tgt_index"])
     return s, t_logp, t_c
 
 
@@ -427,6 +445,14 @@ def main():
     p.add_argument("--prefix-blocked", action="store_true",
                    help="run the conditional branch with prefix->target attention "
                         "cut, for continuing from a stage-2 checkpoint")
+    p.add_argument("--uncond-head", action="store_true",
+                   help="install an auxiliary head predicting the CFG "
+                        "unconditional branch from the conditional hidden state, "
+                        "and train ONLY that head (the rest of the student is "
+                        "frozen). Guidance is then mixed at inference from one "
+                        "forward pass, so --guidance-scale stays a runtime knob "
+                        "instead of being baked into audio_heads. Adds 8.4M "
+                        "params (1.7%%).")
     p.add_argument("--guidance-scale", type=float, default=2.0,
                    help="the w the student learns to bake in (inference default 2.0)")
     p.add_argument("--device", default=None)
@@ -491,6 +517,19 @@ def main():
         _resolve_model_path(args.model or args.teacher),
         train=True, dtype=DTYPES[args.dtype],
         attn_implementation="sdpa").to(device).train()
+    if args.uncond_head:
+        if student.uncond_heads is None:
+            student.config.uncond_head = True
+            fresh = OmniVoice(student.config)
+            fresh.load_state_dict(student.state_dict(), strict=False)
+            student = fresh.to(device).train()
+        for q in student.parameters():
+            q.requires_grad_(False)
+        for q in student.uncond_heads.parameters():
+            q.requires_grad_(True)
+        n = sum(q.numel() for q in student.uncond_heads.parameters())
+        print(f"  uncond head installed: {n / 1e6:.1f}M trainable, "
+              f"rest of the student frozen")
     if args.grad_checkpointing:
         student.llm.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs={"use_reentrant": False})
