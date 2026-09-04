@@ -1190,6 +1190,39 @@ Quick-reference table of everything measured against the local checkpoint. ✅
 **Note on the tokenizer histogram:** script-based vocab pruning for a typical 10-language set
 retains ~144k of 151k tokens — essentially nothing. **Frequency-based pruning is required.**
 
+### 11.6 `guidance_scale=0` did not actually skip the unconditional branch ✅
+
+`_generate_iterative` always allocated `2 * B` rows and ran the LM over all of them, then read
+`batch_logits[B + i]` only when guidance was on. With `guidance_scale=0` the unconditional half was
+computed every step and discarded, so a guidance-distilled student cost exactly as much as the
+teacher it was supposed to replace — the entire point of stage 3, silently unrealised.
+
+Fixed by building and running only the conditional rows when `guidance_scale == 0`
+(`omnivoice.py`, `_generate_iterative`). Measured on `models/p4+p3/student_distil`, 16 steps,
+M4 Pro / MPS fp32:
+
+| | forward shape | wall (9 clips) |
+|---|---|---|
+| guided, w=1.0 | (2, 250) | 31.9 s |
+| unguided, before fix | (2, 250) | 31.6 s |
+| unguided, after fix | (1, 250) | 17.3 s |
+
+**1.84× end-to-end, and the audio is bit-identical** (checksum unchanged) — the discarded half never
+influenced the output. Close to the 2× ceiling because the LM forward is 94% of the pipeline
+(§11.1).
+
+**Implication:** any measurement of a guidance-distilled model taken before this fix understated
+its speed by ~1.8×. The `uncond_heads` path was unaffected; it already ran a single pass.
+
+**It also broke `scripts/eval/prefix_cache.py`,** which assumed the batch is always `2B` and bailed
+out to the uncached forward on an odd row count — printing "prefix K/V cache enabled" while caching
+nothing. Fixed there by deriving the prefix length from the blocked mask (prefix queries see only
+the prefix, so the smallest non-empty row count *is* the prefix length) when the unconditional rows
+are absent. **`--prefix-cached` now requires `--prefix-blocked`**: without the block every row sees
+`c_len` and there is nothing to hoist.
+
+---
+
 ---
 
 ## 12. Constraints and dead ends

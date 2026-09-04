@@ -145,12 +145,18 @@ def main():
     ap.add_argument("--no-wer", dest="wer", action="store_false")
     ap.add_argument("--prefix-cached", action="store_true",
                     help="prefix K/V hoist (bit-identical output, real speedup)")
+    ap.add_argument("--prefix-blocked", action="store_true",
+                    help="apply the stage-2 attention block in the stock path. "
+                         "REQUIRED for any p2 descendant when not using "
+                         "--prefix-cached, which blocks implicitly. Without it "
+                         "the model runs under a topology it was not trained "
+                         "for and the numbers are invalid.")
     args = ap.parse_args()
 
     import torch
     import soundfile as sf
     from omnivoice.models.omnivoice import (OmniVoice, OmniVoiceGenerationConfig,
-                                            VoiceClonePrompt)
+                                            VoiceClonePrompt, place_codec)
 
     configs = [parse_config(c) for c in (args.config or ["32:0.1"])]
     os.makedirs(args.out_dir, exist_ok=True)
@@ -158,13 +164,13 @@ def main():
     print("loading model ...", flush=True)
     dtype = getattr(torch, DTYPES[args.dtype])
     model = OmniVoice.from_pretrained(args.model, device_map="cpu", dtype=torch.float32)
-    if args.device == "mps":
-        codec, fe = model.audio_tokenizer, model.feature_extractor
-        model.audio_tokenizer = None
-        model.to(args.device, dtype)
-        model.audio_tokenizer, model.feature_extractor = codec, fe
-    else:
-        model.to(args.device, dtype)
+    codec = model.audio_tokenizer
+    model.audio_tokenizer = None
+    model.to(args.device, dtype)
+    # The codec must not inherit the LM's dtype (fp16 overflows to NaN) and is
+    # probed onto the device rather than assumed to work there.
+    model.audio_tokenizer = place_codec(codec, args.device,
+                                        model.config.num_audio_codebook)
     model.eval()
 
     pairs = build_pairs(args, model.duration_estimator)
@@ -180,7 +186,8 @@ def main():
             continue
         toks = torch.from_numpy(np.load(ref["_codec"])).long()
         with torch.no_grad():
-            wav = model.audio_tokenizer.decode(toks.unsqueeze(0)).audio_values[0]
+            wav = model.audio_tokenizer.decode(
+                toks.unsqueeze(0).to(model.audio_tokenizer.device)).audio_values[0]
         wav = wav.detach().cpu().numpy()
         prompts[ref["name"]] = VoiceClonePrompt(
             ref_audio_tokens=toks, ref_text=ref["transcription"],
@@ -202,7 +209,7 @@ def main():
     results = {}
 
     for tag, cfg in configs:
-        gc = OmniVoiceGenerationConfig(**cfg)
+        gc = OmniVoiceGenerationConfig(prefix_blocked=args.prefix_blocked, **cfg)
         recs = []
         for i, (ref, tgt) in enumerate(pairs[:args.warmup] + pairs):
             warm = i < args.warmup
@@ -235,7 +242,7 @@ def main():
         import jiwer, mlx_whisper
         from whisper_normalizer.english import EnglishTextNormalizer
         sys.path.insert(0, os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "step_reduction"))
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "p1_step_reduction"))
         from wer_sweep import ascii_punct
         norm = EnglishTextNormalizer()
         for tag, recs in list(results.items()):

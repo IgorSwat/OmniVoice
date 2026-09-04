@@ -177,6 +177,10 @@ class OmniVoiceGenerationConfig:
     num_step: int = 32
     guidance_scale: float = 2.0
     t_shift: float = 0.1
+    # Stage-2 (prefix-blocking) checkpoints are deployed with prefix -> target
+    # attention removed. Running them under full attention is a topology mismatch
+    # and badly degrades text adherence, so it must match how they were trained.
+    prefix_blocked: bool = False
     layer_penalty_factor: float = 5.0
     position_temperature: float = 5.0
     class_temperature: float = 0.0
@@ -1387,17 +1391,22 @@ class OmniVoice(PreTrainedModel):
         max_c_len = max(c_lens)
         pad_id = self.config.audio_mask_id  # Or any other tokens
 
+        # Without guidance the unconditional rows are never read, so they are not
+        # built or run at all: the forward is B rows instead of 2B.
+        guided = gen_config.guidance_scale != 0
+        n_rows = 2 * B if guided else B
+
         batch_input_ids = torch.full(
-            (2 * B, self.config.num_audio_codebook, max_c_len),
+            (n_rows, self.config.num_audio_codebook, max_c_len),
             pad_id,
             dtype=torch.long,
             device=self.device,
         )
         batch_audio_mask = torch.zeros(
-            (2 * B, max_c_len), dtype=torch.bool, device=self.device
+            (n_rows, max_c_len), dtype=torch.bool, device=self.device
         )
         batch_attention_mask = torch.zeros(
-            (2 * B, 1, max_c_len, max_c_len), dtype=torch.bool, device=self.device
+            (n_rows, 1, max_c_len, max_c_len), dtype=torch.bool, device=self.device
         )
 
         for i, inp in enumerate(inputs_list):
@@ -1407,14 +1416,21 @@ class OmniVoice(PreTrainedModel):
             batch_input_ids[i, :, :c_len] = inp["input_ids"]
             batch_audio_mask[i, :c_len] = inp["audio_mask"]
             batch_attention_mask[i, :, :c_len, :c_len] = True
+            if gen_config.prefix_blocked:
+                # The target still sees the whole prefix; only the reverse
+                # direction is cut. The unconditional rows are target-only, so
+                # they have no prefix and need no block.
+                p_len = c_len - task.target_lens[i]
+                batch_attention_mask[i, :, :p_len, p_len:c_len] = False
 
             # Uncond (B ~ 2B-1)
-            batch_input_ids[B + i, :, :u_len] = inp["input_ids"][..., -u_len:]
-            batch_audio_mask[B + i, :u_len] = inp["audio_mask"][..., -u_len:]
-            batch_attention_mask[B + i, :, :u_len, :u_len] = True
-            if max_c_len > u_len:
-                pad_diag = torch.arange(u_len, max_c_len, device=self.device)
-                batch_attention_mask[B + i, :, pad_diag, pad_diag] = True
+            if guided:
+                batch_input_ids[B + i, :, :u_len] = inp["input_ids"][..., -u_len:]
+                batch_audio_mask[B + i, :u_len] = inp["audio_mask"][..., -u_len:]
+                batch_attention_mask[B + i, :, :u_len, :u_len] = True
+                if max_c_len > u_len:
+                    pad_diag = torch.arange(u_len, max_c_len, device=self.device)
+                    batch_attention_mask[B + i, :, pad_diag, pad_diag] = True
 
         tokens = torch.full(
             (B, self.config.num_audio_codebook, max(task.target_lens)),
@@ -1490,7 +1506,11 @@ class OmniVoice(PreTrainedModel):
                     u_logits = _u[i : i + 1, :, c_len - t_len : c_len, :]
                 else:
                     c_logits = batch_logits[i : i + 1, :, c_len - t_len : c_len, :]
-                    u_logits = batch_logits[B + i : B + i + 1, :, :t_len, :]
+                    u_logits = (
+                        batch_logits[B + i : B + i + 1, :, :t_len, :]
+                        if guided
+                        else None
+                    )
 
                 pred_tokens, scores = self._predict_tokens_with_scoring(
                     c_logits, u_logits, gen_config
@@ -1514,7 +1534,8 @@ class OmniVoice(PreTrainedModel):
                 # Update individual slices into batched structure
                 tokens[i : i + 1, :, :t_len] = sample_tokens
                 batch_input_ids[i : i + 1, :, c_len - t_len : c_len] = sample_tokens
-                batch_input_ids[B + i : B + i + 1, :, :t_len] = sample_tokens
+                if guided:
+                    batch_input_ids[B + i : B + i + 1, :, :t_len] = sample_tokens
 
         return [tokens[i, :, : task.target_lens[i]] for i in range(B)]
 

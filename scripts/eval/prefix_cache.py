@@ -87,12 +87,16 @@ class PrefixCachedGenerator:
 
     def __call__(self, input_ids=None, audio_mask=None, attention_mask=None, **kw):
         am = attention_mask
-        if am is None or am.dim() != 4 or am.shape[0] % 2 != 0:
+        # With guidance off, `_generate_iterative` builds only the conditional
+        # rows, so the batch is B rather than 2B and there is no unconditional
+        # half to read the target length from.
+        cond_only = self.skip_uncond and am is not None and am.dim() == 4
+        if am is None or am.dim() != 4 or (not cond_only and am.shape[0] % 2 != 0):
             return self._orig_forward(input_ids=input_ids, audio_mask=audio_mask,
                                       attention_mask=am, **kw)
 
         model, cfg = self.model, self.model.config
-        B = am.shape[0] // 2
+        B = am.shape[0] if cond_only else am.shape[0] // 2
         dev = input_ids.device
 
         # `_prepare_embed_inputs` is positionwise, so embed only the slices that are
@@ -114,9 +118,17 @@ class PrefixCachedGenerator:
             # Max over query rows, not row 0: target queries are never masked and
             # carry the full count, so this stays correct even if a mask-blocking
             # wrapper has already edited the tensor in place.
-            c_len = int(am[i, 0].sum(-1).max())
-            t_len = int(am[B + i, 0].sum(-1).max())
-            p = c_len - t_len
+            keys = am[i, 0].sum(-1)
+            c_len = int(keys.max())
+            if cond_only:
+                # Prefix queries see only the prefix under the stage-2 block, so
+                # the smallest non-empty row count IS the prefix length. Without
+                # the block every row sees c_len and there is nothing to cache.
+                p = int(keys[keys > 0].min())
+                t_len = c_len - p
+            else:
+                t_len = int(am[B + i, 0].sum(-1).max())
+                p = c_len - t_len
             if not 0 < p < c_len:                    # no prefix: nothing to cache
                 return self._orig_forward(input_ids=input_ids, audio_mask=audio_mask,
                                           attention_mask=am, **kw)

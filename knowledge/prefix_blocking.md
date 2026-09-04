@@ -288,3 +288,36 @@ In order, cheapest first:
 
 The ordering matters because step 1 costs minutes and may make steps 3–4 unnecessary — the same
 shape of result as stage 1, where the recommended tuning turned out to be the entire problem.
+
+---
+
+## 11. `generate()` did not apply the block — and silently produced garbage ✅
+
+`OmniVoice._generate_iterative` built the conditional mask as
+`batch_attention_mask[i, :, :c_len, :c_len] = True` — **full bidirectional attention**. Every
+stage-2 descendant (`models/p2`, `models/p4/*`, `models/p4+p3/*`) is trained and deployed with
+prefix → target attention removed, so the stock generation path ran all of them under the wrong
+topology.
+
+The failure is not subtle but it is easy to misread: the model speaks part of the **reference
+transcript** before the target text, and drops or garbles target words. It looks like a bad
+checkpoint or a duration-estimator bug. Measured on `diana`, `round_07_tuned_with_kd`, 16 steps:
+
+| | w=2.0 | w=1.0 |
+|---|---|---|
+| full attention (stock) | 16.0% WER | 32.0% WER |
+| prefix blocked | **0.0%** | **0.0%** |
+
+Across the 9-clip `data/test` set after the fix: mean WER 0.8% (teacher, CFG) and 1.2% (student,
+no CFG), with 8 of 9 clips at exactly 0.0%.
+
+Fixed by adding `prefix_blocked: bool = False` to `OmniVoiceGenerationConfig` and applying the
+block to the conditional rows. It is **opt-in**: the original `k2-fsa/OmniVoice` was not trained
+with the block and must not get it. The unconditional rows are target-only, so they have no prefix
+and need no block.
+
+**This omission has now occurred three separate times** (a WER sweep, a duration test, and a blind
+test), each time producing a plausible-looking but invalid result. Topology mismatch remains the
+largest single degradation measured in this project. **Any generation from a stage-2 descendant
+must pass `prefix_blocked=True`, and any result produced without it should be discarded, not
+interpreted.**
