@@ -42,13 +42,17 @@ FRAME_RATE = 25.0
 def parse_config(spec):
     """``"16:0.1"`` or ``"16:0.1:0.0"`` (the third field is guidance_scale)."""
     parts = spec.split(":")
-    if len(parts) not in (2, 3):
-        raise SystemExit(f"bad --config {spec!r}: want STEPS:T_SHIFT[:GUIDANCE]")
+    if len(parts) < 2:
+        raise SystemExit(f"bad --config {spec!r}: want STEPS:T_SHIFT[:GUIDANCE[:k=v...]]")
     cfg = {"num_step": int(parts[0]), "t_shift": float(parts[1])}
     tag = f"s{cfg['num_step']}_t{cfg['t_shift']}"
-    if len(parts) == 3:
+    if len(parts) >= 3:
         cfg["guidance_scale"] = float(parts[2])
         tag += f"_g{cfg['guidance_scale']}"
+    for extra in parts[3:]:                      # e.g. remask_ratio=0.5
+        k, v = extra.split("=", 1)
+        cfg[k] = int(v) if v.lstrip("-").isdigit() else float(v)
+        tag += f"_{''.join(w[0] for w in k.split('_'))}{v}"
     return tag, cfg
 
 

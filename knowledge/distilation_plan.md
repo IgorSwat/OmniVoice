@@ -1225,6 +1225,66 @@ are absent. **`--prefix-cached` now requires `--prefix-blocked`**: without the b
 
 ---
 
+## 11.7 Sampler loop on the fragile cells — confidence remasking is the one that works ✅
+
+Setup: the 8 (speaker × target) cells of `data/test` that carried most errors in the 81-cell
+sweeps, 5 seeds each for selection (40 runs/config) and **10 fresh seeds for confirmation**
+(80 runs/config), paired per seed. `models/p4+p3/student_distil`, prefix blocked, no CFG.
+Baseline: 16 steps, default sampler. Scratch harness in the session scratchpad (`fragile.py`).
+
+**Everything that perturbs the default sampler makes it worse, and every variant *redistributes*
+failures** — each partially fixes the worst cell (morgan × norbi, a prefix-boundary leak) while
+breaking 2–12 seeds that were stable. Selection seeds, 40 runs each, vs baseline 3 fails / 8 errs:
+
+| variant | fail | errs | fixed | broke | note |
+|---|---|---|---|---|---|
+| position_temperature 0 | 15 | 100 | 0 | 12 | **catastrophic** — the Gumbel noise is load-bearing |
+| position_temperature 2.5 / 10 | 7 / 5 | 14 / 10 | 3 / 2 | 7 / 4 | |
+| layer_penalty 2.5 / 10 | 4 / 10 | 11 / 22 | 2 / 3 | 3 / 10 | |
+| duration ×0.90 / ×1.15 | 6 / 6 | 14 / 10 | 2 / 3 | 5 / 6 | longer canvas fixes morgan×norbi, breaks others |
+| t_shift 0.2 | 13 | 35 | 2 | 12 | |
+| class_temperature 0.5 | 8 | 24 | 3 | 8 | |
+| 32 steps | 2 | 5 | 2 | 1 | deletions → 0, at 2.2× cost |
+
+The global confidence trace does **not** separate failing from passing runs (AUC ≈ 0.5), so a
+free intrinsic verifier for best-of-N is dead as measured.
+
+**Confidence remasking** (`remask_ratio`, MaskGIT-style revisiting: after every non-final step,
+re-mask `ratio × (tokens just committed)` of the lowest-confidence *previously* committed tokens;
+the final step fills everything left). Held-out seeds 6–15, 80 runs per config:
+
+| config | steps | fail | errs | fixed | broke | cost vs base |
+|---|---|---|---|---|---|---|
+| baseline | 16 | 11 (13.8%) | 19 | — | — | 1.00× |
+| remask 0.25 | 16 | 7 | 19 | 7 | 3 | 1.03× |
+| remask 0.5 | 16 | 3 | 5 | 9 | 1 | 1.09× |
+| **remask 0.75** | 16 | **0** | **0** | 11 | 0 | 1.06× |
+| **12 steps + remask 0.5** | 12 | **1** | 2 | 11 | 1 | **0.87×** |
+| 10 steps + remask 0.5 | 10 | 5 | 7 | 8 | 2 | 0.72× |
+
+Over all 120 runs remask 0.75 is 0 failures vs the baseline's 14. No mask ids leak into the
+codec (checked on 120 captured token sets). The 9-clip test set stays at 0.0% WER under both 0.5
+and 0.75, so the easy majority is not harmed; blind sets are in `tmp/blind_remask` and
+`tmp/blind_remask75`.
+
+**What it actually does.** Because the schedule is back-loaded and remasking withdraws most of
+each early commit, the net effect is a long *drafting* phase followed by a very large final fill:
+at 16 steps the final pass commits 39% of tokens unmasked, 69% at remask 0.5 and
+81% at remask 0.75 — the last step sees a near-complete draft as context and re-decides
+most of it. So the gain is less "revisiting a few mistakes" than "commit late, with everything as
+context". That is consistent with 32 steps helping and with every *order*-changing variant hurting.
+
+**Deployment recommendation:** `num_step=12, remask_ratio=0.5` — better than the current 16-step
+default on the fragile cells at 13% less cost — or `remask_ratio=0.75` at 16 steps for maximum
+robustness at +6%. Both are inference-only, no retraining.
+
+**Blind listen (9 clips, baseline 16 vs remask 0.5, same model): remask won 6–0 with 3 ties,
+two-sided sign test p = 0.031.** The prosody-flattening worry was wrong in the direction that
+matters: the listener's notes credit remask with better *continuity* and with eliminating a
+"slight mumbling" on laure, and every clip rated "more natural" was the remask arm. Adopt it.
+
+---
+
 ## 12. Constraints and dead ends
 
 **Hard constraints:**
@@ -1236,6 +1296,54 @@ are absent. **`--prefix-cached` now requires `--prefix-blocked`**: without the b
 - **GQA requires `H % Kv == 0`** with equal group sizes.
 
 **Doesn't work:**
+
+- **Biasing the unmasking order towards earlier frames.** Proposed as a cheap way to give the
+  parallel sampler a pseudo-autoregressive structure in time, so that a "text pointer" is better
+  defined. Tested with `time_penalty_factor` (same shape as `layer_penalty_factor`, ramped 0 →
+  factor across the utterance) on `models/p4+p3/student_distil`, 16 steps, no CFG, prefix blocked,
+  over the full 81 cross-speaker cells of `data/test` with paired per-cell seeds:
+
+  | time penalty | WER | deletions | vs baseline | 95% CI | W/L/T | sign p |
+  |---|---|---|---|---|---|---|
+  | 0 (baseline) | 0.13% | 0.13% | — | — | — | — |
+  | 5 | 0.30% | 0.13% | +0.17% | [-0.09%, +0.47%] | 3/6/72 | 0.508 |
+  | 15 | 0.73% | 0.51% | +0.60% | [+0.21%, +1.06%] | 1/9/71 | 0.021 |
+  | 40 | 0.77% | 0.47% | +0.64% | [+0.17%, +1.21%] | 1/8/72 | 0.039 |
+
+  **Monotone dose-response, and the damage is specifically deletions** (0.13% → 0.51%), which is
+  the signature of committing a frame before its context exists. Confidence-first ordering is
+  load-bearing: MaskGIT anchors uncertain regions on the ones it is already sure about, and forcing
+  time order removes that. Any alignment mechanism therefore has to constrain the *representation*
+  (a CTC auxiliary head) or the *duration budget*, not the commit order.
+
+  Caveat on power: the baseline sits at 0.13%, so this design detects harm well but has little room
+  to show benefit. The negative conclusion is safe; a null at penalty 5 is not evidence of no effect.
+
+- **Two-phase "semantic planner / acoustic filler" sampling.** Spend the first `planner_steps`
+  committing only codebooks `< planner_codebooks`, then fill the rest in the remaining passes. The
+  hope was Mimi's factorisation built in the sampler: concentrate diffusion on the decision-carrying
+  coarse codebooks, one-shot the low-entropy acoustic ones. Zero-shot on
+  `models/p4+p3/student_distil`, 81 cross-speaker cells, paired seeds, cost-matched baselines:
+
+  | passes | config | WER | del | ins | ΔWER vs 16-base | 95% CI | W/L/T | p |
+  |---|---|---|---|---|---|---|---|---|
+  | 16 | baseline | 0.13% | 0.13% | 0.00% | — | — | — | — |
+  | 16 | 1cb ×10 + fill 6 | 0.21% | 0.09% | 0.04% | +0.09% | [-0.17%, +0.39%] | 3/3/75 | 1.000 |
+  | 16 | 2cb ×12 + fill 4 | 0.30% | 0.09% | 0.17% | +0.17% | [-0.09%, +0.52%] | 2/4/75 | 0.688 |
+  | 10 | baseline | 0.51% | 0.34% | 0.04% | +0.38% | [+0.08%, +0.73%] | 2/9/70 | 0.065 |
+  | 10 | 2cb ×8 + fill 2 | 0.56% | 0.13% | 0.21% | +0.43% | [+0.13%, +0.81%] | 0/7/74 | 0.016 |
+  | 8 | baseline | 0.81% | 0.13% | 0.21% | +0.68% | [+0.26%, +1.18%] | 1/12/68 | 0.003 |
+  | 8 | 2cb ×6 + fill 2 | 0.81% | 0.26% | 0.17% | +0.68% | [+0.13%, +1.46%] | 0/6/75 | 0.031 |
+
+  **Null at every cost point.** At matched passes the planner tracks the plain baseline; the only
+  thing it changes is the error *mix* — fewer deletions, more insertions — netting to zero. The
+  reason is that `layer_penalty_factor=5.0` already commits coarse codebooks first (span 35 across
+  8 codebooks), so an explicit planner phase supplies no ordering the sampler lacked. A real
+  factorisation would need the *filler* to be a cheaper model, which is a training project, not a
+  sampler change. Note also that a diffusion step costs a full forward over every frame and
+  codebook regardless of how many codebooks may commit, so restricting commits saves nothing.
+  Knobs kept, inert at default: `planner_codebooks=0`, `planner_steps=0`.
+
 
 - **KV *merging*** (Kv 8→4 at H=16) — saves 16.7% of attention params but **zero** S² cost, since
   attention scales with query heads only. And there's no KV cache here, so GQA's usual payoff is

@@ -100,14 +100,24 @@ def parse_config(spec):
     their directory names and stay resumable.
     """
     parts = spec.split(":")
-    if len(parts) not in (2, 3):
-        raise SystemExit(f"bad --config {spec!r}: want STEPS:T_SHIFT[:GUIDANCE]")
+    if len(parts) < 2:
+        raise SystemExit(
+            f"bad --config {spec!r}: want STEPS:T_SHIFT[:GUIDANCE[:k=v...]]")
     steps, t_shift = int(parts[0]), float(parts[1])
     cfg = {"num_step": steps, "t_shift": t_shift}
     tag = f"s{steps}_t{t_shift}"
-    if len(parts) == 3:
+    if len(parts) >= 3:
         cfg["guidance_scale"] = float(parts[2])
         tag += f"_g{cfg['guidance_scale']}"
+    for extra in parts[3:]:
+        if "=" in extra:                     # e.g. planner_codebooks=2
+            k, v = extra.split("=", 1)
+            cfg[k] = int(v) if v.lstrip("-").isdigit() else float(v)
+            short = "".join(w[0] for w in k.split("_"))
+            tag += f"_{short}{v}"
+        else:                                # legacy positional time penalty
+            cfg["time_penalty_factor"] = float(extra)
+            tag += f"_tp{cfg['time_penalty_factor']}"
     return tag, cfg
 
 
@@ -213,7 +223,8 @@ def stage_generate(args, refs, targets, configs):
                 text=targets[tg],
                 language="en",
                 voice_clone_prompt=prompts[sp],
-                generation_config=OmniVoiceGenerationConfig(**cfg_by_tag[tag]),
+                generation_config=OmniVoiceGenerationConfig(
+                    prefix_blocked=args.prefix_blocked, **cfg_by_tag[tag]),
             )[0]
             dt = time.time() - t
 
@@ -436,6 +447,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--test-dir", default="data/test")
+    ap.add_argument("--prefix-blocked", action="store_true",
+                    help="stage-2 attention topology; required for p2 descendants")
     ap.add_argument("--out-dir", default="runs/step_reduction")
     ap.add_argument("--model", default="k2-fsa/OmniVoice")
     ap.add_argument("--config", action="append", metavar="STEPS:T_SHIFT[:GUIDANCE]",

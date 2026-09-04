@@ -182,6 +182,21 @@ class OmniVoiceGenerationConfig:
     # and badly degrades text adherence, so it must match how they were trained.
     prefix_blocked: bool = False
     layer_penalty_factor: float = 5.0
+    # Same idea as layer_penalty_factor but along time: subtract this much from
+    # the selection score, ramped 0 -> factor across the utterance, so earlier
+    # frames are committed first. 0 keeps the original confidence-only order.
+    time_penalty_factor: float = 0.0
+    # Two-phase "planner / filler" sampling. For the first `planner_steps` only
+    # codebooks < planner_codebooks may be committed (the coarse, decision-
+    # carrying ones); the remaining num_step - planner_steps passes fill the rest.
+    # 0 disables it and every step may commit any codebook, as originally.
+    planner_codebooks: int = 0
+    planner_steps: int = 0
+    # MaskGIT-style revisiting: after each non-final step, re-mask this fraction
+    # (of the tokens just committed) of the LOWEST-confidence previously
+    # committed tokens, so early mistakes can be corrected with later context.
+    # The final step always fills whatever is still masked.
+    remask_ratio: float = 0.0
     position_temperature: float = 5.0
     class_temperature: float = 0.0
     denoise: bool = True
@@ -1439,29 +1454,27 @@ class OmniVoice(PreTrainedModel):
             device=self.device,
         )
 
-        timesteps = _get_time_steps(
-            t_start=0.0,
-            t_end=1.0,
-            num_step=gen_config.num_step,
-            t_shift=gen_config.t_shift,
-        ).tolist()
-        schedules = []
-        for t_len in task.target_lens:
-            total_mask = t_len * self.config.num_audio_codebook
-            rem = total_mask
-            sched = []
-            for step in range(gen_config.num_step):
-                num = (
-                    rem
-                    if step == gen_config.num_step - 1
-                    else min(
-                        math.ceil(total_mask * (timesteps[step + 1] - timesteps[step])),
-                        rem,
-                    )
-                )
+        def _schedule(total_mask, n_steps):
+            ts = _get_time_steps(t_start=0.0, t_end=1.0, num_step=n_steps,
+                                 t_shift=gen_config.t_shift).tolist()
+            rem, sched = total_mask, []
+            for step in range(n_steps):
+                num = (rem if step == n_steps - 1
+                       else min(math.ceil(total_mask * (ts[step + 1] - ts[step])), rem))
                 sched.append(int(num))
                 rem -= int(num)
-            schedules.append(sched)
+            return sched
+
+        C = self.config.num_audio_codebook
+        Pc, Ps = gen_config.planner_codebooks, gen_config.planner_steps
+        two_phase = 0 < Pc < C and 0 < Ps < gen_config.num_step
+        schedules = []
+        for t_len in task.target_lens:
+            if two_phase:
+                schedules.append(_schedule(t_len * Pc, Ps)
+                                 + _schedule(t_len * (C - Pc), gen_config.num_step - Ps))
+            else:
+                schedules.append(_schedule(t_len * C, gen_config.num_step))
 
         layer_ids = torch.arange(
             self.config.num_audio_codebook, device=self.device
@@ -1515,8 +1528,15 @@ class OmniVoice(PreTrainedModel):
                 pred_tokens, scores = self._predict_tokens_with_scoring(
                     c_logits, u_logits, gen_config
                 )
+                conf = scores.clone()          # raw confidence, before penalties
 
                 scores = scores - (layer_ids * gen_config.layer_penalty_factor)
+                if two_phase and step < Ps:
+                    scores[:, Pc:, :] = -float("inf")
+                if gen_config.time_penalty_factor != 0.0:
+                    ramp = torch.arange(t_len, device=scores.device,
+                                        dtype=scores.dtype) / max(t_len - 1, 1)
+                    scores = scores - gen_config.time_penalty_factor * ramp
 
                 if gen_config.position_temperature > 0.0:
                     scores = _gumbel_sample(scores, gen_config.position_temperature)
@@ -1526,9 +1546,22 @@ class OmniVoice(PreTrainedModel):
                     sample_tokens != self.config.audio_mask_id, -float("inf")
                 )
 
+                last = step == gen_config.num_step - 1
+                if gen_config.remask_ratio > 0.0 and last:
+                    # remasking grew the remaining budget; fill everything left
+                    k = int((sample_tokens == self.config.audio_mask_id).sum())
                 _, topk_idx = torch.topk(scores.flatten(), k)
                 flat_tokens = sample_tokens.flatten()
                 flat_tokens[topk_idx] = pred_tokens.flatten()[topk_idx]
+                if gen_config.remask_ratio > 0.0 and not last:
+                    r = int(round(gen_config.remask_ratio * k))
+                    prev = flat_tokens != self.config.audio_mask_id
+                    prev[topk_idx] = False     # never re-mask what was just committed
+                    r = min(r, int(prev.sum()))
+                    if r > 0:
+                        cand = conf.flatten().masked_fill(~prev, float("inf"))
+                        _, low = torch.topk(-cand, r)
+                        flat_tokens[low] = self.config.audio_mask_id
                 sample_tokens.copy_(flat_tokens.view_as(sample_tokens))
 
                 # Update individual slices into batched structure
