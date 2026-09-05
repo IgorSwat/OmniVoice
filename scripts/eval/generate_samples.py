@@ -175,6 +175,8 @@ def main():
     ap.add_argument("--device", default="mps", choices=["mps", "cuda", "cpu"])
     ap.add_argument("--dtype", default="fp16", choices=list(DTYPES))
     ap.add_argument("--seed", type=int, default=1234)
+    ap.add_argument("--gen", action="append", default=[], metavar="KEY=VALUE",
+                    help="extra OmniVoiceGenerationConfig fields, e.g. remask_ratio=0.5")
     ap.add_argument("--overwrite", action="store_true",
                     help="regenerate files that already exist")
     ap.add_argument("--blind", nargs="+", metavar="DIR", default=None,
@@ -241,11 +243,21 @@ def main():
               + ("; unconditional branch SKIPPED (guidance_scale=0)" if skip_u else ""),
               flush=True)
     elif args.prefix_blocked:
-        enable_prefix_blocking(model)
+        pass  # blocking now applied via gen_cfg.prefix_blocked
         print("prefix blocking ENABLED (mask only -- RTF is unchanged)", flush=True)
 
+    # The block lives in the generation config now (omnivoice.py). The old
+    # enable_prefix_blocking() wrapper reads the target length off the
+    # unconditional rows, which no longer exist when guidance_scale=0, so it
+    # silently did nothing for a guidance-distilled student.
+    extra = {}
+    for kv in args.gen:
+        k, v = kv.split("=", 1)
+        extra[k] = (v.lower() == "true") if v.lower() in ("true", "false") else (
+            int(v) if v.lstrip("-").isdigit() else float(v))
     gen_cfg = OmniVoiceGenerationConfig(num_step=args.num_step, t_shift=args.t_shift,
-                                        guidance_scale=args.guidance_scale)
+                                        guidance_scale=args.guidance_scale,
+                                        prefix_blocked=args.prefix_blocked, **extra)
     prompts = {}
     records = []
     order = {s: i for i, s in enumerate(speakers)}

@@ -321,3 +321,26 @@ test), each time producing a plausible-looking but invalid result. Topology mism
 largest single degradation measured in this project. **Any generation from a stage-2 descendant
 must pass `prefix_blocked=True`, and any result produced without it should be discarded, not
 interpreted.**
+
+
+### 11.1 The eval scripts carried a stale copy of the block — and it silently no-ops for a student ✅
+
+`scripts/eval/generate_samples.py::enable_prefix_blocking` (also imported by `prefix_cache.verify`)
+wraps `forward` and recovers the target length from the **unconditional** rows of the `2B` mask.
+Once `_generate_iterative` stopped building those rows for `guidance_scale=0` (§11.6 of the plan),
+the wrapper's `am.shape[0] % 2 == 0` guard fails and it returns without touching the mask —
+**while `--prefix-blocked` still prints as enabled.** Every guidance-distilled arm generated through
+that script ran under full attention.
+
+Caught because a checkpoint comparison scored the student at 12% WER on the 81 cells where the sweep
+harness had measured 0.13% for the same model, config and seed; the reseeded control was 10%, i.e.
+systematic. Direct A/B on one cell, same seed: config flag → correct sentence; old wrapper →
+"Always. I've leave room …".
+
+Fixed by passing `prefix_blocked=args.prefix_blocked` into the generation config in
+`generate_samples.py`; `benchmark.py` and `wer_sweep.py` already do. The old wrapper is left only for
+`prefix_cache.verify`, which compares against it *with* a guided (2B) batch, where it still works.
+
+**Rule that now has four data points:** any result from a stage-2 descendant produced through a
+path that does not set `prefix_blocked=True` on the generation config is invalid. Check the path,
+not the flag name.

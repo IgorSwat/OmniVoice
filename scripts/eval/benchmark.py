@@ -51,7 +51,8 @@ def parse_config(spec):
         tag += f"_g{cfg['guidance_scale']}"
     for extra in parts[3:]:                      # e.g. remask_ratio=0.5
         k, v = extra.split("=", 1)
-        cfg[k] = int(v) if v.lstrip("-").isdigit() else float(v)
+        cfg[k] = (v.lower() == "true") if v.lower() in ("true", "false") else (
+            int(v) if v.lstrip("-").isdigit() else float(v))
         tag += f"_{''.join(w[0] for w in k.split('_'))}{v}"
     return tag, cfg
 

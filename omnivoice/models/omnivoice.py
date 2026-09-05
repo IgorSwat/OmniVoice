@@ -29,6 +29,7 @@ This is the main entry point for both inference and training:
 
 import difflib
 import logging
+import copy
 import math
 import os
 import re
@@ -197,6 +198,28 @@ class OmniVoiceGenerationConfig:
     # committed tokens, so early mistakes can be corrected with later context.
     # The final step always fills whatever is still masked.
     remask_ratio: float = 0.0
+    remask_until: int = -1        # >=0: remask only on steps < this (else every non-final step)
+    remask_codebooks: int = 0     # >0: only tokens in codebooks < this are eligible
+    remask_margin: bool = False   # rank by top1-top2 log-prob margin instead of top1
+    # Soft revisit without masking: a committed token whose fresh prediction
+    # differs and has probability > this is overwritten in place. 0 disables.
+    refine_threshold: float = 0.0
+    # Polish pass: after the schedule completes, ONE extra forward re-decides
+    # tokens in codebooks >= polish_codebooks_from (ratio 1.0 = all of them,
+    # <1 = that fraction, lowest last-step confidence first). Costs one step.
+    polish_codebooks_from: int = 0
+    polish_ratio: float = 1.0
+    # Reference-token heuristics (voice-clone only). ref_remask_bias > 0 makes
+    # tokens that never occur in the reference clip (same codebook) preferred
+    # for remasking; ref_logit_bias > 0 adds that much to the log-prob of tokens
+    # that do occur in the reference. Both act only on codebooks < ref_codebooks.
+    ref_remask_bias: float = 0.0
+    ref_logit_bias: float = 0.0
+    ref_codebooks: int = 2
+    # Run CFG as two forwards instead of one 2B batch: the unconditional branch is
+    # target-only, so it runs on max(target_lens) positions instead of being
+    # padded to the conditional length. Same maths, less compute.
+    cfg_split_passes: bool = False
     position_temperature: float = 5.0
     class_temperature: float = 0.0
     denoise: bool = True
@@ -269,7 +292,9 @@ class OmniVoiceConfig(PretrainedConfig):
         audio_mask_id: int = 1024,
         num_audio_codebook: int = 8,
         audio_codebook_weights: Optional[list[float]] = None,
-        uncond_head: bool = False,
+        uncond_head=False,
+        uncond_head_layers: int = 1,
+        uncond_head_ffn: int = 0,
         llm_config: Optional[Union[dict, PretrainedConfig]] = None,
         **kwargs,
     ):
@@ -288,6 +313,11 @@ class OmniVoiceConfig(PretrainedConfig):
         # Predicts the CFG unconditional branch from the CONDITIONAL pass, so
         # guidance costs one forward instead of two. See OmniVoice.uncond_logits.
         self.uncond_head = uncond_head
+        # For uncond_head == "delta": a small target-only stack of the backbone's
+        # own layer type that predicts log p_c - log p_u from the conditional
+        # hidden state. 0 ffn = same width as the backbone.
+        self.uncond_head_layers = uncond_head_layers
+        self.uncond_head_ffn = uncond_head_ffn
 
 
 def place_codec(codec, device, num_codebooks: int = 8):
@@ -374,15 +404,31 @@ class OmniVoice(PreTrainedModel):
         # would have produced. A linear probe recovers 94% of that branch's final
         # hidden state from the conditional one (centred R^2, shuffled control
         # 0.26), so guidance can be mixed from a single forward pass.
+        kind = getattr(config, "uncond_head", False)
         self.uncond_heads = (
             nn.Linear(
                 self.config.llm_config.hidden_size,
                 config.num_audio_codebook * config.audio_vocab_size,
                 bias=False,
             )
-            if getattr(config, "uncond_head", False)
+            if kind and kind != "delta"
             else None
         )
+        # "delta" head: a tiny model of the backbone's class over the TARGET
+        # positions only, plus a zero-initialised projection to the guidance
+        # direction. See uncond_delta_logits.
+        self.uncond_delta_llm = self.uncond_delta = None
+        if kind == "delta":
+            hc = copy.deepcopy(self.config.llm_config)
+            hc.num_hidden_layers = int(getattr(config, "uncond_head_layers", 1))
+            if getattr(config, "uncond_head_ffn", 0):
+                hc.intermediate_size = int(config.uncond_head_ffn)
+            self.uncond_delta_llm = AutoModel.from_config(hc)
+            self.uncond_delta = nn.Linear(
+                hc.hidden_size, config.num_audio_codebook * config.audio_vocab_size,
+                bias=False,
+            )
+            nn.init.zeros_(self.uncond_delta.weight)
 
         self.normalized_audio_codebook_weights = [
             w / sum(config.audio_codebook_weights)
@@ -399,6 +445,31 @@ class OmniVoice(PreTrainedModel):
         self._asr_pipe = None
         self._asr_model_name = "openai/whisper-large-v3-turbo"
         self._asr_device = None
+
+    def uncond_delta_logits(self, h_target, valid, position_ids):
+        """Guidance direction Delta ~ log p_c - log p_u over the target region.
+
+        ``h_target``: conditional hidden states of the target positions, padded,
+        ``[B, T, H]``; ``valid``: ``[B, T]`` bool; ``position_ids``: the positions
+        those states had in the full sequence, so rotary embeddings stay
+        consistent with the layers the head was initialised from. Attention is
+        restricted to valid target positions of the same item -- the defining
+        property of the unconditional branch. Returns ``[B, C, T, V]``.
+        Unconditional logits are then ``c - Delta`` and the guided mixture is
+        ``log_softmax(c + w * Delta)``; ``w`` stays a runtime knob.
+        """
+        if self.uncond_delta_llm is None:
+            raise RuntimeError('this checkpoint has no delta head; set uncond_head="delta" '
+                               "in config.json and train it (train_uncond_delta.py)")
+        B, T, _ = h_target.shape
+        attn = valid[:, None, None, :] & valid[:, None, :, None]
+        eye = torch.eye(T, dtype=torch.bool, device=h_target.device)
+        attn = attn | eye[None, None]          # padded queries attend to self: no all-False rows
+        h = self.uncond_delta_llm(inputs_embeds=h_target, attention_mask=attn,
+                                  position_ids=position_ids, return_dict=True).last_hidden_state
+        return self.uncond_delta(h).view(
+            B, T, self.config.num_audio_codebook, self.config.audio_vocab_size
+        ).permute(0, 2, 1, 3)
 
     def uncond_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Unconditional-branch logits predicted from the CONDITIONAL hidden state.
@@ -1480,30 +1551,67 @@ class OmniVoice(PreTrainedModel):
             self.config.num_audio_codebook, device=self.device
         ).view(1, -1, 1)
 
-        for step in range(gen_config.num_step):
-            if self.uncond_heads is not None and gen_config.guidance_scale != 0:
-                # One pass: the unconditional branch is predicted from the
-                # conditional hidden state rather than recomputed.
+        def _guided_forward():
+            """Returns (c, u, batch_logits): uncond-head layout, split layout, or batched."""
+            one_pass = (self.uncond_heads is not None or self.uncond_delta_llm is not None)
+            if one_pass and gen_config.guidance_scale != 0:
                 _L = max(c_lens)
-                _h = self.llm(
-                    inputs_embeds=self._prepare_embed_inputs(
-                        batch_input_ids[:B, :, :_L], batch_audio_mask[:B, :_L]
-                    ),
+                _h = self.llm(inputs_embeds=self._prepare_embed_inputs(
+                        batch_input_ids[:B, :, :_L], batch_audio_mask[:B, :_L]),
                     attention_mask=batch_attention_mask[:B, :, :_L, :_L],
-                    return_dict=True,
-                ).last_hidden_state
-                _c = self.audio_heads(_h).view(
-                    B, _L, self.config.num_audio_codebook,
-                    self.config.audio_vocab_size
-                ).permute(0, 2, 1, 3).to(torch.float32)
-                _u = self.uncond_logits(_h).to(torch.float32)
-            else:
-                batch_logits = self(
-                    input_ids=batch_input_ids,
-                    audio_mask=batch_audio_mask,
-                    attention_mask=batch_attention_mask,
-                ).logits.to(torch.float32)
-                _c = _u = None
+                    return_dict=True).last_hidden_state
+                _c = self.audio_heads(_h).view(B, _L, self.config.num_audio_codebook,
+                    self.config.audio_vocab_size).permute(0, 2, 1, 3).to(torch.float32)
+                if self.uncond_delta_llm is None:
+                    return _c, self.uncond_logits(_h).to(torch.float32), None
+                Tm = max(task.target_lens)
+                ht = _h.new_zeros(B, Tm, _h.shape[-1])
+                valid = torch.zeros(B, Tm, dtype=torch.bool, device=_h.device)
+                pos = torch.zeros(B, Tm, dtype=torch.long, device=_h.device)
+                for i in range(B):
+                    c_len, t_len = c_lens[i], task.target_lens[i]
+                    ht[i, :t_len] = _h[i, c_len - t_len:c_len]
+                    valid[i, :t_len] = True
+                    pos[i, :t_len] = torch.arange(c_len - t_len, c_len, device=_h.device)
+                delta = self.uncond_delta_logits(ht, valid, pos).to(torch.float32)
+                _u = _c.clone()
+                for i in range(B):
+                    c_len, t_len = c_lens[i], task.target_lens[i]
+                    _u[i, :, c_len - t_len:c_len] = _c[i, :, c_len - t_len:c_len] - delta[i, :, :t_len]
+                return _c, _u, None
+            if guided and gen_config.cfg_split_passes:
+                U = max(task.target_lens)
+                lc = self(input_ids=batch_input_ids[:B], audio_mask=batch_audio_mask[:B],
+                          attention_mask=batch_attention_mask[:B]).logits.to(torch.float32)
+                lu = self(input_ids=batch_input_ids[B:, :, :U], audio_mask=batch_audio_mask[B:, :U],
+                          attention_mask=batch_attention_mask[B:, :, :U, :U]).logits.to(torch.float32)
+                return None, lu, lc
+            return None, None, self(input_ids=batch_input_ids, audio_mask=batch_audio_mask,
+                                    attention_mask=batch_attention_mask).logits.to(torch.float32)
+
+        def _item_logits(_c, _u, batch_logits, i):
+            c_len, t_len = c_lens[i], task.target_lens[i]
+            if _c is not None:                                   # uncond head
+                return _c[i:i+1, :, c_len-t_len:c_len, :], _u[i:i+1, :, c_len-t_len:c_len, :]
+            cl = batch_logits[i:i+1, :, c_len-t_len:c_len, :]
+            if _u is not None:                                   # split passes
+                return cl, _u[i:i+1, :, :t_len, :]
+            return cl, (batch_logits[B+i:B+i+1, :, :t_len, :] if guided else None)
+
+        last_conf = {}
+        in_ref = {}
+        if gen_config.ref_remask_bias > 0.0 or gen_config.ref_logit_bias > 0.0:
+            for i in range(B):
+                rt = task.ref_audio_tokens[i]
+                if rt is None:
+                    continue
+                tab = torch.zeros(self.config.num_audio_codebook, self.config.audio_vocab_size,
+                                  dtype=torch.bool, device=self.device)
+                tab.scatter_(1, rt.to(self.device).long(), True)
+                tab[gen_config.ref_codebooks:] = False
+                in_ref[i] = tab
+        for step in range(gen_config.num_step):
+            _c, _u, batch_logits = _guided_forward()
 
             for i in range(B):
                 k = schedules[i][step]
@@ -1511,24 +1619,21 @@ class OmniVoice(PreTrainedModel):
                     continue
 
                 c_len, t_len = c_lens[i], task.target_lens[i]
+                c_logits, u_logits = _item_logits(_c, _u, batch_logits, i)   # [1, C, T, V]
 
-                # Extract real target Logits
-                # [1, C, T, V]
-                if _c is not None:
-                    c_logits = _c[i : i + 1, :, c_len - t_len : c_len, :]
-                    u_logits = _u[i : i + 1, :, c_len - t_len : c_len, :]
-                else:
-                    c_logits = batch_logits[i : i + 1, :, c_len - t_len : c_len, :]
-                    u_logits = (
-                        batch_logits[B + i : B + i + 1, :, :t_len, :]
-                        if guided
-                        else None
-                    )
-
+                if gen_config.ref_logit_bias > 0.0 and i in in_ref:
+                    c_logits = c_logits + gen_config.ref_logit_bias * in_ref[i][None, :, None, :].to(c_logits.dtype)
                 pred_tokens, scores = self._predict_tokens_with_scoring(
                     c_logits, u_logits, gen_config
                 )
                 conf = scores.clone()          # raw confidence, before penalties
+                if step == gen_config.num_step - 1:
+                    last_conf[i] = conf
+                if gen_config.remask_margin:
+                    lp2 = F.log_softmax(c_logits, dim=-1)
+                    lp2[..., self.config.audio_mask_id] = -float("inf")
+                    t2 = lp2.topk(2, dim=-1).values
+                    conf = t2[..., 0] - t2[..., 1]
 
                 scores = scores - (layer_ids * gen_config.layer_penalty_factor)
                 if two_phase and step < Ps:
@@ -1547,19 +1652,31 @@ class OmniVoice(PreTrainedModel):
                 )
 
                 last = step == gen_config.num_step - 1
+                if gen_config.refine_threshold > 0.0 and not last:
+                    committed = sample_tokens != self.config.audio_mask_id
+                    sure = conf.exp() > gen_config.refine_threshold
+                    flip = committed & sure & (pred_tokens != sample_tokens)
+                    sample_tokens[flip] = pred_tokens[flip]
                 if gen_config.remask_ratio > 0.0 and last:
                     # remasking grew the remaining budget; fill everything left
                     k = int((sample_tokens == self.config.audio_mask_id).sum())
                 _, topk_idx = torch.topk(scores.flatten(), k)
                 flat_tokens = sample_tokens.flatten()
                 flat_tokens[topk_idx] = pred_tokens.flatten()[topk_idx]
-                if gen_config.remask_ratio > 0.0 and not last:
+                allow = gen_config.remask_until < 0 or step < gen_config.remask_until
+                if gen_config.remask_ratio > 0.0 and not last and allow:
                     r = int(round(gen_config.remask_ratio * k))
                     prev = flat_tokens != self.config.audio_mask_id
                     prev[topk_idx] = False     # never re-mask what was just committed
+                    if gen_config.remask_codebooks > 0:
+                        cb = torch.arange(prev.numel(), device=prev.device) // t_len
+                        prev &= cb < gen_config.remask_codebooks
                     r = min(r, int(prev.sum()))
                     if r > 0:
                         cand = conf.flatten().masked_fill(~prev, float("inf"))
+                        if gen_config.ref_remask_bias > 0.0 and i in in_ref:
+                            present = in_ref[i].gather(1, sample_tokens[0].clamp(max=self.config.audio_vocab_size - 1)).flatten()
+                            cand = cand + gen_config.ref_remask_bias * present.to(cand.dtype)
                         _, low = torch.topk(-cand, r)
                         flat_tokens[low] = self.config.audio_mask_id
                 sample_tokens.copy_(flat_tokens.view_as(sample_tokens))
@@ -1569,6 +1686,33 @@ class OmniVoice(PreTrainedModel):
                 batch_input_ids[i : i + 1, :, c_len - t_len : c_len] = sample_tokens
                 if guided:
                     batch_input_ids[B + i : B + i + 1, :, :t_len] = sample_tokens
+
+        pf = gen_config.polish_codebooks_from
+        if 0 < pf < self.config.num_audio_codebook:
+            mid = self.config.audio_mask_id
+            for i in range(B):
+                c_len, t_len = c_lens[i], task.target_lens[i]
+                st = tokens[i : i + 1, :, :t_len]
+                sel = torch.zeros_like(st, dtype=torch.bool); sel[:, pf:, :] = True
+                if gen_config.polish_ratio < 1.0 and i in last_conf:
+                    n = int(round(gen_config.polish_ratio * int(sel.sum())))
+                    cand = last_conf[i].masked_fill(~sel, float("inf")).flatten()
+                    sel = torch.zeros_like(sel).flatten()
+                    if n > 0:
+                        sel[torch.topk(-cand, n).indices] = True
+                    sel = sel.view_as(st)
+                st[sel] = mid
+                batch_input_ids[i : i + 1, :, c_len - t_len : c_len] = st
+                if guided:
+                    batch_input_ids[B + i : B + i + 1, :, :t_len] = st
+            _c, _u, batch_logits = _guided_forward()
+            for i in range(B):
+                c_len, t_len = c_lens[i], task.target_lens[i]
+                cl, ul = _item_logits(_c, _u, batch_logits, i)
+                pred, _ = self._predict_tokens_with_scoring(cl, ul, gen_config)
+                st = tokens[i : i + 1, :, :t_len]
+                m_ = st == mid
+                st[m_] = pred[m_]
 
         return [tokens[i, :, : task.target_lens[i]] for i in range(B)]
 

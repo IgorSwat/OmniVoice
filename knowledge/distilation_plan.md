@@ -1247,7 +1247,13 @@ breaking 2–12 seeds that were stable. Selection seeds, 40 runs each, vs baseli
 | 32 steps | 2 | 5 | 2 | 1 | deletions → 0, at 2.2× cost |
 
 The global confidence trace does **not** separate failing from passing runs (AUC ≈ 0.5), so a
-free intrinsic verifier for best-of-N is dead as measured.
+free intrinsic verifier for best-of-N is dead as measured. A second, task-matched signal confirms
+it: re-mask 30% of a finished sample (3 random masks) and score how confidently / how often the
+model re-predicts its own committed tokens. On 80 base16 samples (11 failures): AUC 0.57 over the
+whole target, **0.43–0.47 on the first 40 frames** where the failures live, i.e. inverted. Failing
+samples are *internally consistent* — the model re-predicts its own dropped-word sentence. They
+are coherent alternative outputs, not detectable mistakes, so any best-of-N needs an external
+check (ASR), not a model-intrinsic one.
 
 **Confidence remasking** (`remask_ratio`, MaskGIT-style revisiting: after every non-final step,
 re-mask `ratio × (tokens just committed)` of the lowest-confidence *previously* committed tokens;
@@ -1274,14 +1280,245 @@ at 16 steps the final pass commits 39% of tokens unmasked, 69% at remask 0.5 and
 most of it. So the gain is less "revisiting a few mistakes" than "commit late, with everything as
 context". That is consistent with 32 steps helping and with every *order*-changing variant hurting.
 
-**Deployment recommendation:** `num_step=12, remask_ratio=0.5` — better than the current 16-step
-default on the fragile cells at 13% less cost — or `remask_ratio=0.75` at 16 steps for maximum
-robustness at +6%. Both are inference-only, no retraining.
+**Remask refinements (round 8, 10 steps, held-out seeds 6–15, 80 runs each, paired vs
+`s10_rm0.5` at 5 fails / 7 errs):**
+
+| variant | fail | errs | fixed | broke | verdict |
+|---|---|---|---|---|---|
+| remask only codebooks 0–1 (`remask_codebooks=2`) | **1** | 2 | 4 | 0 | **works** |
+| ratio 0.75 | **1** | 1 | 4 | 0 | **works** |
+| stop remasking after step 6 (`remask_until=6`) | 6 | 11 | 0 | 1 | worse — late remasking is the point |
+| rank by top1–top2 margin (`remask_margin`) | 5 | 12 | 3 | 3 | null |
+| soft overwrite, no mask (`refine_threshold=0.9`) | 17 | 43 | 2 | 14 | **catastrophic** |
+| remask 0.5 + soft overwrite | 5 | 7 | 0 | 0 | inert on top of remask |
+
+Two findings. Restricting the revisit to the decision-carrying codebooks buys as much as raising
+the ratio — the acoustic codebooks do not need revisiting, only the ones that decide what is said.
+And overwriting committed tokens *without* masking them destroys coherence: the model must see a
+mask to re-decide; a fresh argmax over a fully visible context is not a correction signal.
+
+**Round 9 — codebook cutoff × ratio, and the 8-step operating point** (held-out seeds 6–15, 80
+runs each):
+
+| config | fail | errs | fixed | broke | gen s |
+|---|---|---|---|---|---|
+| 10 steps, rm 0.5 | 5 | 7 | — | — | 1.40 |
+| 10, rm 0.5, codebooks <1 | 4 | 4 | 4 | 3 | 1.28 |
+| **10, rm 0.5, codebooks <2** | **1** | 2 | 4 | 0 | 1.29 |
+| 10, rm 0.5, codebooks <3 | 3 | 4 | 2 | 0 | 1.30 |
+| 10, rm 0.75, codebooks <2 | 2 | 4 | 4 | 1 | 1.28 |
+| 8 steps, plain | 30 | 70 | — | — | 1.07 |
+| **8, rm 0.5, codebooks <2** | **2** | 3 | 28 | 0 | 1.08 |
+| 8, rm 0.75 | 4 | 7 | 27 | 1 | 1.08 |
+| 8, rm 0.75, codebooks <2 | 5 | 13 | 25 | 0 | 1.07 |
+
+Cutoff 2 is the sweet spot: codebook 0 alone is too narrow (codebook 1 also carries decisions),
+3 is already worse, and stacking the cutoff with ratio 0.75 does not help — at 8 steps 0.75 starts
+inserting words because the final fill gets too large. **8 steps + remask 0.5 on codebooks 0–1
+fails 2/80 where the original 16-step default fails 11/80, at 56% of its cost.**
+
+Ladder on the fragile cells (held-out): 16 base 11 → 16 rm0.75 **0** → 12 rm0.5 1 → 10 rm0.5 cb2 1
+→ 8 rm0.5 cb2 2 (gen s 1.94 → 2.06 → 1.68 → 1.29 → 1.08).
+
+**Deployment recommendation (updated):** `num_step=8, remask_ratio=0.5, remask_codebooks=2` —
+better than the 16-step default on the fragile cells at about half the cost, 0.0% WER on the 9-clip
+test set, blind set in `tmp/blind_s8cb2` (vs the 12-step config the listener already rated). Full
+stack benchmark, 5 s ref / 5 s target, MPS fp16, prefix cached, codec on MPS: **RTF 0.081, 12.3×
+realtime**, 0.40 s latency (9 LM calls at 32.7 ms; "other" is now 22% and the next target).
+`num_step=10` with the same remask is the conservative choice (1/80). All inference-only.
+
+**Polish pass (`polish_codebooks_from=2`, one extra forward after the schedule that re-decides
+the acoustic codebooks 2–7 with the complete draft as context; `polish_ratio<1` re-decides only
+that fraction, lowest last-step confidence first).** Proposed as "s8cb2 + 1" to buy back the
+acoustic quality the listener heard missing at 8 steps. WER guard, held-out seeds 6–15, 80 runs,
+paired vs `s8_rm0.5_cb2` (2 fails / 3 errs): polish-all **2 / 3** with an identical error count on
+78/80 runs — intelligibility untouched, as designed, since codebooks 0–1 are never re-masked;
+polish-0.5 3 / 4, i.e. selecting by stale confidence is no better than re-deciding everything.
+Cost is one forward in nine (measured RTF 0.081 → 0.085); wall-clock figures from these
+runs are contended and not usable. **Blind listen (9 clips, s8cb2 vs s8cb2 + polish-all): polish won 6–0 with 3 ties, two-sided
+sign test p = 0.031.** Every decided note describes the polish arm as "cleaner" or "sharper"; the
+one named defect (a tiny voice crack at the end of paul) was on the *baseline* arm. So the pass
+does what it was built for — it recovers acoustic quality without touching intelligibility — for
+one forward in nine. **Adopt it: `num_step=8, remask_ratio=0.5, remask_codebooks=2,
+polish_codebooks_from=2` is the new budget configuration** (measured RTF 0.085, 11.8× realtime, 0.43 s latency at 5 s ref / 5 s target, 10 LM calls). Blind set kept in
+`tmp/blind_polish`.
+
+**Listening verdict on the 8-step config** (open comparison vs 12 steps + remask 0.5, 9 clips):
+the difference *is* audible — 8 steps sits a little below 12 — but the 8-step samples are good
+quality with intelligible speech throughout. Read it as a **budget option when speed is the
+priority**, not as a free replacement: 12 steps + remask 0.5 remains the quality choice, 8 steps
++ remask 0.5 on codebooks 0–1 the speed choice (RTF 0.081 vs 0.105).
+
+**If you go for the s8cb2 budget, make it s8cb2 + 1: spend one extra step on the polish pass
+(`polish_codebooks_from=2`).** It costs one forward in nine and won the blind listen 6–0 against
+plain s8cb2, recovering the acoustic cleanness that was the whole audible gap to 12 steps, with
+intelligibility unchanged. The budget option is `num_step=8, remask_ratio=0.5,
+remask_codebooks=2, polish_codebooks_from=2`, not s8cb2 alone.
 
 **Blind listen (9 clips, baseline 16 vs remask 0.5, same model): remask won 6–0 with 3 ties,
 two-sided sign test p = 0.031.** The prosody-flattening worry was wrong in the direction that
 matters: the listener's notes credit remask with better *continuity* and with eliminating a
 "slight mumbling" on laure, and every clip rated "more natural" was the remask arm. Adopt it.
+
+---
+
+## 11.8 Checkpoint comparison: self-distilled vs real-teacher-distilled (no-CFG students) ✅
+
+`models/p4+p3/student_distil` (teacher = itself with CFG, w=1.0) vs `models/p4+p3/teacher_distil`
+(teacher = `models/p2` with CFG). Same 21-layer init, same sampler (16 steps, no CFG, prefix
+blocked), same seed per cell. **Generated through the fixed `generate_samples.py`** — the first
+attempt ran both under full attention and read 12% / 27% WER; see prefix_blocking.md §11.1.
+
+| | dev KL → p2-CFG (w=1) ↓ | dev CE | test WER (81 cells) | del | SIM | f0 st | dB std |
+|---|---|---|---|---|---|---|---|
+| student_distil | 0.3324 | 4.8110 | 0.17% | 0.12% | 0.9675 | 5.34 | 6.21 |
+| teacher_distil | **0.2378** | **4.7757** | 2.60% | 1.86% | 0.9670 | 5.30 | 6.18 |
+| student reseeded (noise floor) | — | — | 1.24% | 0.99% | 0.9664 | 5.46 | 6.27 |
+
+(unguided p2 gap on dev: 0.2775)
+
+**Verdict: split, and the split is the informative part.** teacher_distil matches the *real*
+teacher's distribution better on dev — that was its objective and it shows (KL 0.24 vs 0.33, below
+the unguided gap). But on the test set it drops more words: +2.44 pp WER against a +1.07 pp
+reseed floor (2.3× the floor), deletions 1.86% vs ~0.1–1.0%, audio ~0.3 s shorter. Paired per cell:
+student better 18, teacher_distil better 3, tie 60; sign test p = 0.001. Speaker similarity and
+prosody are **identical within noise** (SIM 0.4×, f0 0.3×, dB 0.6× the floor).
+
+Reading: distilling toward the stronger, deeper teacher's guided distribution buys distributional
+fidelity but not sample-level intelligibility here — the self-distilled student matched a target it
+already reproduced well and kept its text adherence. Prefer `student_distil` for deployment as
+things stand; if `teacher_distil` is retained, the deletion rate is the thing to fix, and
+remasking (§11.7) is the obvious first lever since it targets exactly that failure.
+
+---
+
+## 11.9 Reference-token statistics: what the clip's tokens can and cannot tell the sampler ✅
+
+Question: can properties of the reference clip's codec tokens (unigram/pair statistics,
+correlations) be turned into a diffusion heuristic? Measured on the 9 `data/test` references
+(91–247 frames) and 80 base16 fragile-cell samples (11 failures), student_distil.
+
+**The statistics are sparse.** Distinct tokens per frame is 0.72 (codebook 0) to 0.91 (codebook 7):
+almost every frame is a new token, so 1025-way unigrams from ~150 frames are mostly noise and pair
+/ bigram statistics are hopeless.
+
+| cb | within-speaker JS (half vs half) | between-speaker JS | ratio | generated: JS to own ref / to others | coverage of generated by own ref |
+|---|---|---|---|---|---|
+| 0 | 0.030 | 0.065 | 2.2 | 0.063 / 0.094 | 54% |
+| 1 | 0.032 | 0.062 | 2.0 | 0.070 / 0.083 | 34% |
+| 2–3 | 0.033 | 0.060 | 1.8 | 0.069 / 0.081 | 30–37% |
+| 4–7 | 0.033 | 0.058 | 1.7 | 0.073 / 0.077 | 21–33% |
+
+References do discriminate their speaker on token unigrams, but only ~2× above within-speaker
+noise, and generated output tracks its own reference barely better than others past codebook 1.
+Correct outputs are covered by the reference's token set only 34–54% on the content codebooks, so
+**a prior toward reference tokens would push the model off correct tokens the clip never
+contained** — argues against a logit bias.
+
+**One real signal, and it is the first verifier-type signal above 0.6 in this project:** failing
+samples deviate more from their reference on codebooks 0–1 (JS AUC 0.70 / 0.67, coverage AUC
+0.66 / 0.72) and not at all on 2–7 (AUC 0.46–0.56). A garbled or dropped word produces
+codebook-0 tokens atypical for that speaker. As a best-of-2 selector it is dominated by remasking
+(≈2.5× fewer failures at 2× cost, vs remask 0.75's 0/80 at 1.06×), but it motivates a cheaper
+use: steer the *remask* budget toward reference-absent tokens on codebooks 0–1
+(`ref_remask_bias`). Tested together with the logit bias (`ref_logit_bias`) for completeness.
+
+**Round 11** (10 steps + remask 0.5 as base, 5 fails / 7 errs; held-out seeds 6–15, 80 runs each):
+
+| variant | fail | errs | fixed | broke |
+|---|---|---|---|---|
+| ref_remask_bias 2 / 5 | 6 / 6 | 10 / 11 | 1 / 3 | 2 / 4 |
+| ref_logit_bias 0.5 | 5 | 8 | 3 | 3 |
+| ref_logit_bias 1.0 | **1** | 1 | 4 | 0 |
+| budget config (8 steps, cb2) + ref_remask_bias 2 | 3 | 4 | 1 | 2 | (vs 2 / 3) |
+
+**The remask-bias idea is dead:** steering the revisit budget toward reference-absent tokens is
+worse at both strengths and worse on the budget config, so the AUC-0.7 signal does not convert
+into a better criterion — the tokens it flags are not the ones worth re-deciding. **The logit bias
+at 1.0 is a single striking point that contradicts the coverage argument above and is non-monotone
+with 0.5 (null).** One point against the reasoning, at 5 baseline failures, is what noise looks
+like; it is held pending a fresh seed set (16–25) and a dose curve (1.5, 2.0), plus the budget
+config — round 12.
+
+**Round 12 — it was noise.** Dose on seeds 6–15 (fail / errs, fixed / broke vs base 5 / 7):
+0.5 → 5 / 8 (3 / 3); 1.0 → 1 / 1 (4 / 0); 1.5 → 3 / 3 (4 / 2); 2.0 → 2 / 3 (5 / 2) — not
+monotone, and past 1.0 it redistributes. Fresh seeds 16–25: base 4 / 10, bias 1.0 → 3 / 6,
+fixed 3 broke 2 — indistinguishable. On the budget config (8 steps, cb2, 2 / 3): **6 / 8, broke
+5** — clearly harmful.
+
+**Verdict on reference-token statistics: closed.** The clip's token unigrams carry one weak
+diagnostic signal (codebooks 0–1, AUC ≈ 0.7) and it converts into nothing: neither steering the
+remask budget nor a logit prior improves sampling, and the prior actively hurts the budget
+config. This matches both the sparsity measurement (a ~150-frame clip covers only 34–54% of a
+correct output's content tokens) and the earlier finding that the model's speaker conditioning
+lives in its representations, not in token frequencies. Pair / correlation statistics were ruled
+out before testing on sparsity alone. Knobs `ref_remask_bias`, `ref_logit_bias`, `ref_codebooks`
+are left inert at their defaults, as with the other dead ends.
+
+---
+
+## 11.10 Final comparison of the remasking configurations ✅
+
+`models/p4+p3/student_distil`, no CFG, prefix blocked. Three instruments: word error on the 8
+fragile cells × 10 held-out seeds (80 runs), WER / WavLM speaker similarity / prosody on the full
+81-cell cross-speaker grid with a reseeded control as the noise floor (`compare_models.py`), and
+RTF at 5 s ref / 5 s target, MPS fp16, prefix cached, codec on MPS. Samples in `tmp/final/<arm>/`.
+
+| config | fragile fail / 80 | fragile errs | grid WER | SIM | f0 st | RTF | × realtime | latency | LM calls |
+|---|---|---|---|---|---|---|---|---|---|
+| a) 16 steps + remask 0.5 | 3 | 5 | 0.29% | 0.9654 | 5.32 | 0.135 | 7.4 | 0.67 s | 17 |
+| b) 16 steps + remask 0.5, codebooks 0–1 | 3 | 4 | 0.21% | 0.9658 | 5.28 | 0.136 | 7.3 | 0.67 s | 17 |
+| c) 12 steps + remask 0.5 | 1 | 2 | 0.25% | 0.9642 | 5.43 | 0.106 | 9.4 | 0.53 s | 13 |
+| d) 12 steps + codebooks 0–1 + polish | 2 | 3 | 0.21% | 0.9675 | 5.26 | 0.113 | 8.8 | 0.57 s | 14 |
+| e) 8 steps + codebooks 0–1 + polish | 2 | 3 | 0.21% | 0.9673 | 5.45 | 0.088 | 11.4 | 0.43 s | 10 |
+| noise floor: a) reseeded | — | — | 0.00% | 0.9663 | 5.31 | | | | |
+
+Paired on the fragile subset vs a): b) fixed 2 / broke 2, c) 3 / 1, d) 3 / 2, e) 3 / 2.
+
+**Reading.** By every automatic metric the five are a wash: grid WER and speaker similarity all
+sit inside the reseed noise floor (SIM floor 0.0009; d and e are 0.001–0.002 *above* a, marginal
+and in the good direction), and the fragile-subset failures are 1–3 / 80 with paired deltas of
+±2, i.e. not separable at this n. The fragile numbers reproduce the earlier rounds exactly
+(a 3/80, c 1/80, e 2/80), so the harness is stable across the session rebuild. Prosody spread
+is slightly wider for c and e (f0 5.43–5.45 st vs 5.26–5.32) — small, but 10× the floor, and
+consistent with the listener hearing 8 steps as a touch rougher than 12.
+
+**Speed is the only axis that separates them**, and it is monotone in LM calls: e) is 1.53× faster
+than a) at equal automatic quality. The codebook restriction and the polish pass cost nothing
+measurable in quality and nothing in speed beyond their extra call. Given the listening results
+(§11.7: 16 ≥ 12 by a little; polish > none at 8, 6–0; 8 a little below 12), the practical menu is:
+
+- **quality:** c) 12 steps + remask 0.5 (or a) if the extra 0.14 s is free) — RTF 0.106
+- **balanced:** d) 12 steps + codebooks 0–1 + polish — RTF 0.113, tightest prosody, highest SIM
+- **budget:** e) 8 steps + codebooks 0–1 + polish — RTF 0.088, 11.4× realtime, intelligible throughout
+
+Against the shipped default (RTF 0.998) these are 7.4× to 11.4×, all inference-only.
+
+---
+
+## 11.11 CFG as two unpadded passes, on the undistilled 21-layer model ✅
+
+`OmniVoiceGenerationConfig.cfg_split_passes=True` runs guidance as two forwards — conditional on
+the full sequence, unconditional on `max(target_lens)` positions — instead of one 2B batch padded
+to the conditional length. **Bit-identical** to the batched path (equal checksum on a test clip;
+forwards 9 → 9 + 9, the unconditional pass on 127 positions instead of 331). `prefix_cache.py`
+already ran the branches this way; this brings the stock path in line.
+
+`models/p4/round_07_tuned_with_kd` (pruned, **not** guidance-distilled, so CFG is required),
+guidance 2.0, remask 0.5 on codebooks 0–1 + polish, 5 s ref / 5 s target, MPS fp16:
+
+| config | RTF | × realtime | latency | LM calls |
+|---|---|---|---|---|
+| 12 steps, CFG batched 2B, uncached | 0.311 | 3.2 | 1.58 s | 13 |
+| 12 steps, CFG split passes, uncached | 0.255 | 3.9 | 1.29 s | 26 |
+| 12 steps, CFG split + prefix cached | 0.197 | 5.1 | 1.00 s | 27 |
+|  8 steps, CFG split + prefix cached | 0.142 | 7.1 | 0.71 s | 19 |
+
+Splitting alone is worth 1.22× on the stock path — the padding was that expensive — and caching
+another 1.29× on top. Against the guidance-distilled student at the same sampler settings
+(§11.10: RTF 0.113 / 0.088), keeping real CFG costs 1.75× at 12 steps and 1.61× at 8: that is the
+price of the second branch after every other saving, i.e. exactly what stage-3 distillation buys.
+Samples on the 81-cell grid: `tmp/final/p4kd_s12cb2_p1_cfg`, `tmp/final/p4kd_s8cb2_p1_cfg`.
 
 ---
 
