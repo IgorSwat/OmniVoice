@@ -421,6 +421,9 @@ class OmniVoice(PreTrainedModel):
         if kind == "delta":
             hc = copy.deepcopy(self.config.llm_config)
             hc.num_hidden_layers = int(getattr(config, "uncond_head_layers", 1))
+            # The head is fed hidden states, never token ids: shrink the text
+            # embedding table the model class would otherwise build (155M params).
+            hc.vocab_size = 1
             if getattr(config, "uncond_head_ffn", 0):
                 hc.intermediate_size = int(config.uncond_head_ffn)
             self.uncond_delta_llm = AutoModel.from_config(hc)
