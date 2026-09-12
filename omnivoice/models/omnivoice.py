@@ -188,6 +188,19 @@ class OmniVoiceGenerationConfig:
     pad_duration: float = 0.1
     fade_duration: float = 0.1
 
+    # Custom modifications - inference - prefix blocking
+    prefix_blocked: bool = False        # False disables the prefix -> target attention connections
+
+    # Custom modifications - sampling - remasking
+    remask_ratio: float = 0.0
+    remask_until: int = -1        # >=0: remask only on steps < this (else every non-final step)
+    remask_codebooks: int = 0     # >0: only tokens in codebooks < this are eligible for remask
+    remask_margin: bool = False   # rank by top1-top2 log-prob margin instead of top1
+
+    # Custom modifications - sampling - polish pass
+    polish_codebooks_from: int = 0  # only tokens in codebooks >= this are eligible for a polish pass
+    polish_ratio: float = 1.0       # total ratio of withdrawn tokens
+
     @classmethod
     def from_dict(cls, kwargs_dict):
         valid_keys = {f.name for f in fields(cls)}
@@ -356,14 +369,15 @@ class OmniVoice(PreTrainedModel):
                         "eustlb/higgs-audio-v2-tokenizer"
                     )
 
-                # higgs-audio-v2-tokenizer does not support MPS
-                # (output channels > 65536)
                 tokenizer_device = (
                     "cpu" if str(model.device).startswith("mps") else model.device
                 )
+
                 model.audio_tokenizer = HiggsAudioV2TokenizerModel.from_pretrained(
                     audio_tokenizer_path, device_map=tokenizer_device
                 )
+                model.audio_tokenizer = model.audio_tokenizer.to(model.device, torch.float32)
+
                 model.feature_extractor = AutoFeatureExtractor.from_pretrained(
                     audio_tokenizer_path
                 )
@@ -1317,17 +1331,22 @@ class OmniVoice(PreTrainedModel):
         max_c_len = max(c_lens)
         pad_id = self.config.audio_mask_id  # Or any other tokens
 
+        # Depending on whether CFG is enabled or not, model might run a single unguided pass,
+        # or a double batched (B * 2) guided pass.
+        guided = gen_config.guidance_scale != 0
+        n_rows = 2 * B if guided else B
+
         batch_input_ids = torch.full(
-            (2 * B, self.config.num_audio_codebook, max_c_len),
+            (n_rows, self.config.num_audio_codebook, max_c_len),
             pad_id,
             dtype=torch.long,
             device=self.device,
         )
         batch_audio_mask = torch.zeros(
-            (2 * B, max_c_len), dtype=torch.bool, device=self.device
+            (n_rows, max_c_len), dtype=torch.bool, device=self.device
         )
         batch_attention_mask = torch.zeros(
-            (2 * B, 1, max_c_len, max_c_len), dtype=torch.bool, device=self.device
+            (n_rows, 1, max_c_len, max_c_len), dtype=torch.bool, device=self.device
         )
 
         for i, inp in enumerate(inputs_list):
@@ -1338,13 +1357,19 @@ class OmniVoice(PreTrainedModel):
             batch_audio_mask[i, :c_len] = inp["audio_mask"]
             batch_attention_mask[i, :, :c_len, :c_len] = True
 
+            # Prefix blocking - a fixup for model's attention mask.
+            if gen_config.prefix_blocked:
+                p_len = c_len - task.target_lens[i]
+                batch_attention_mask[i, :, :p_len, p_len:c_len] = False   # Disables forward connections between prefix and target
+
             # Uncond (B ~ 2B-1)
-            batch_input_ids[B + i, :, :u_len] = inp["input_ids"][..., -u_len:]
-            batch_audio_mask[B + i, :u_len] = inp["audio_mask"][..., -u_len:]
-            batch_attention_mask[B + i, :, :u_len, :u_len] = True
-            if max_c_len > u_len:
-                pad_diag = torch.arange(u_len, max_c_len, device=self.device)
-                batch_attention_mask[B + i, :, pad_diag, pad_diag] = True
+            if guided:
+                batch_input_ids[B + i, :, :u_len] = inp["input_ids"][..., -u_len:]
+                batch_audio_mask[B + i, :u_len] = inp["audio_mask"][..., -u_len:]
+                batch_attention_mask[B + i, :, :u_len, :u_len] = True
+                if max_c_len > u_len:
+                    pad_diag = torch.arange(u_len, max_c_len, device=self.device)
+                    batch_attention_mask[B + i, :, pad_diag, pad_diag] = True
 
         tokens = torch.full(
             (B, self.config.num_audio_codebook, max(task.target_lens)),
@@ -1353,40 +1378,39 @@ class OmniVoice(PreTrainedModel):
             device=self.device,
         )
 
-        timesteps = _get_time_steps(
-            t_start=0.0,
-            t_end=1.0,
-            num_step=gen_config.num_step,
-            t_shift=gen_config.t_shift,
-        ).tolist()
-        schedules = []
-        for t_len in task.target_lens:
-            total_mask = t_len * self.config.num_audio_codebook
-            rem = total_mask
-            sched = []
-            for step in range(gen_config.num_step):
-                num = (
-                    rem
-                    if step == gen_config.num_step - 1
-                    else min(
-                        math.ceil(total_mask * (timesteps[step + 1] - timesteps[step])),
-                        rem,
-                    )
-                )
+        def _schedule(total_mask, n_steps):
+            ts = _get_time_steps(t_start=0.0, t_end=1.0, num_step=n_steps,
+                                 t_shift=gen_config.t_shift).tolist()
+            rem, sched = total_mask, []
+            for step in range(n_steps):
+                num = (rem if step == n_steps - 1
+                       else min(math.ceil(total_mask * (ts[step + 1] - ts[step])), rem))
                 sched.append(int(num))
                 rem -= int(num)
-            schedules.append(sched)
+            return sched
+
+        C = self.config.num_audio_codebook
+        schedules = [_schedule(t_len * C, gen_config.num_step)
+                     for t_len in task.target_lens]
 
         layer_ids = torch.arange(
             self.config.num_audio_codebook, device=self.device
         ).view(1, -1, 1)
 
+        def _forward():
+            """One LM call over the batch; with guidance the rows are [cond | uncond]."""
+            return self(input_ids=batch_input_ids, audio_mask=batch_audio_mask,
+                        attention_mask=batch_attention_mask).logits.to(torch.float32)
+
+        def _item_logits(batch_logits, i):
+            c_len, t_len = c_lens[i], task.target_lens[i]
+            cl = batch_logits[i:i+1, :, c_len-t_len:c_len, :]
+            return cl, (batch_logits[B+i:B+i+1, :, :t_len, :] if guided else None)
+
+        last_conf = {}
         for step in range(gen_config.num_step):
-            batch_logits = self(
-                input_ids=batch_input_ids,
-                audio_mask=batch_audio_mask,
-                attention_mask=batch_attention_mask,
-            ).logits.to(torch.float32)
+            batch_logits = self(input_ids=batch_input_ids, audio_mask=batch_audio_mask,
+                                attention_mask=batch_attention_mask).logits.to(torch.float32)
 
             for i in range(B):
                 k = schedules[i][step]
@@ -1394,15 +1418,19 @@ class OmniVoice(PreTrainedModel):
                     continue
 
                 c_len, t_len = c_lens[i], task.target_lens[i]
-
-                # Extract real target Logits
-                # [1, C, T, V]
-                c_logits = batch_logits[i : i + 1, :, c_len - t_len : c_len, :]
-                u_logits = batch_logits[B + i : B + i + 1, :, :t_len, :]
+                c_logits, u_logits = _item_logits(batch_logits, i)   # [1, C, T, V]
 
                 pred_tokens, scores = self._predict_tokens_with_scoring(
                     c_logits, u_logits, gen_config
                 )
+                conf = scores.clone()          # raw confidence, before penalties
+                if step == gen_config.num_step - 1:
+                    last_conf[i] = conf
+                if gen_config.remask_margin:
+                    lp2 = F.log_softmax(c_logits, dim=-1)
+                    lp2[..., self.config.audio_mask_id] = -float("inf")
+                    t2 = lp2.topk(2, dim=-1).values
+                    conf = t2[..., 0] - t2[..., 1]
 
                 scores = scores - (layer_ids * gen_config.layer_penalty_factor)
 
@@ -1414,15 +1442,66 @@ class OmniVoice(PreTrainedModel):
                     sample_tokens != self.config.audio_mask_id, -float("inf")
                 )
 
+                last = step == gen_config.num_step - 1
+
+                # `last` is special-cased: withdrawals grew the pool past the
+                # schedule's budget, so the final step fills whatever is left.
+                if gen_config.remask_ratio > 0.0 and last:
+                    # remasking grew the remaining budget; fill everything left
+                    k = int((sample_tokens == self.config.audio_mask_id).sum())
                 _, topk_idx = torch.topk(scores.flatten(), k)
                 flat_tokens = sample_tokens.flatten()
                 flat_tokens[topk_idx] = pred_tokens.flatten()[topk_idx]
+                allow = gen_config.remask_until < 0 or step < gen_config.remask_until
+                if gen_config.remask_ratio > 0.0 and not last and allow:
+                    r = int(round(gen_config.remask_ratio * k))
+                    prev = flat_tokens != self.config.audio_mask_id
+                    prev[topk_idx] = False     # never re-mask what was just committed
+                    if gen_config.remask_codebooks > 0:
+                        cb = torch.arange(prev.numel(), device=prev.device) // t_len
+                        prev &= cb < gen_config.remask_codebooks
+                    r = min(r, int(prev.sum()))
+                    if r > 0:
+                        cand = conf.flatten().masked_fill(~prev, float("inf"))
+                        _, low = torch.topk(-cand, r)
+                        flat_tokens[low] = self.config.audio_mask_id
+                        
                 sample_tokens.copy_(flat_tokens.view_as(sample_tokens))
 
                 # Update individual slices into batched structure
                 tokens[i : i + 1, :, :t_len] = sample_tokens
                 batch_input_ids[i : i + 1, :, c_len - t_len : c_len] = sample_tokens
-                batch_input_ids[B + i : B + i + 1, :, :t_len] = sample_tokens
+                if guided:                                # LOCAL CHANGE 3/4
+                    batch_input_ids[B + i : B + i + 1, :, :t_len] = sample_tokens
+
+        # Polish pass: one extra forward after the schedule: re-mask codebooks >= pf
+        # and re-decide them against the finished lower ones.
+        pf = gen_config.polish_codebooks_from
+        if 0 < pf < self.config.num_audio_codebook:
+            mid = self.config.audio_mask_id
+            for i in range(B):
+                c_len, t_len = c_lens[i], task.target_lens[i]
+                st = tokens[i : i + 1, :, :t_len]
+                sel = torch.zeros_like(st, dtype=torch.bool); sel[:, pf:, :] = True
+                if gen_config.polish_ratio < 1.0 and i in last_conf:
+                    n = int(round(gen_config.polish_ratio * int(sel.sum())))
+                    cand = last_conf[i].masked_fill(~sel, float("inf")).flatten()
+                    sel = torch.zeros_like(sel).flatten()
+                    if n > 0:
+                        sel[torch.topk(-cand, n).indices] = True
+                    sel = sel.view_as(st)
+                st[sel] = mid
+                batch_input_ids[i : i + 1, :, c_len - t_len : c_len] = st
+                if guided:                                # LOCAL CHANGE 3/4
+                    batch_input_ids[B + i : B + i + 1, :, :t_len] = st
+            batch_logits = _forward()
+            for i in range(B):
+                c_len, t_len = c_lens[i], task.target_lens[i]
+                cl, ul = _item_logits(batch_logits, i)
+                pred, _ = self._predict_tokens_with_scoring(cl, ul, gen_config)
+                st = tokens[i : i + 1, :, :t_len]
+                m_ = st == mid
+                st[m_] = pred[m_]
 
         return [tokens[i, :, : task.target_lens[i]] for i in range(B)]
 
